@@ -568,16 +568,29 @@
 
                 
                 // Build Posts rows
-                // Compute current post states
+                // Compute current post states using the exact same logic as renderCurrentTable
                 const postState = new Map();
-                const chronoRecords = [...records].sort((a, b) => 
-                    (parseDateKey(a.date) || '').localeCompare(parseDateKey(b.date) || '')
-                );
-                chronoRecords.forEach(r => {
+                records.forEach(r => {
+                    const dateVal = parseDateKey(r.date) || '';
+
+                    // LEAVE event
                     const fromKey = getRoleKey(r.from_post, r.from_dept);
+                    if (fromKey !== '||') {
+                        const existing = postState.get(fromKey);
+                        if (!existing || dateVal > existing.dateVal) {
+                            postState.set(fromKey, { status: 'vacant', holder: '', dateVal: dateVal });
+                        }
+                    }
+
+                    // JOIN event
                     const toKey = getRoleKey(r.to_post, r.to_dept);
-                    if (fromKey !== '||') postState.set(fromKey, { status: 'vacant', holder: '', record: r });
-                    if (toKey !== '||') postState.set(toKey, { status: 'occupied', holder: r.name, record: r });
+                    if (toKey !== '||') {
+                        const existing = postState.get(toKey);
+                        if (!existing || dateVal >= existing.dateVal) {
+                            // JOIN overrides LEAVE on the same day (>=)
+                            postState.set(toKey, { status: 'occupied', holder: r.name, dateVal: dateVal });
+                        }
+                    }
                 });
 
                 const postHeaders = ['職位 (Post)', '部門 (Department)', '狀態 (Status)', '現任 (Holder)', '崗位備註 (Remark)'];
@@ -710,10 +723,6 @@ const colleagueSheetName = workbook.SheetNames.find(n => n === 'Colleagues');
 
                 localStorage.setItem('sys_person_notes_pro', JSON.stringify(personNotes));
                 localStorage.setItem('sys_person_images_pro', JSON.stringify(personImages));
-                localStorage.setItem('sys_person_nicknames_pro', JSON.stringify(personNicknames));
-                localStorage.setItem('sys_role_notes_pro', JSON.stringify(roleNotes));
-                localStorage.setItem('sys_post_overrides', JSON.stringify(postOverrides));
-
                 saveAndSync();
                 renderDatabaseTable();
 
@@ -2159,7 +2168,7 @@ Return ONLY a raw JSON array. Fields: name, from_post, from_dept, to_post, to_de
     </script>
     <input type="file" id="excelImport" accept=".xlsx, .xls" class="hidden" onchange="importFromExcel(event)" />
 
-    <footer class="max-w-7xl mx-auto px-6 py-6 text-center text-xs text-slate-400">Copyright (c) Westdoor Streetson 2026 (v2.79)</footer>
+    <footer class="max-w-7xl mx-auto px-6 py-6 text-center text-xs text-slate-400">Copyright (c) Westdoor Streetson 2026 (v2.81)</footer>
 
     <script>
     document.addEventListener('DOMContentLoaded', function() {
