@@ -282,7 +282,7 @@
                                 <label id="selectionRemarkLabel" class="block text-xs font-bold text-slate-500">備註</label>
                                 <textarea id="selectionRemarkInput" rows="3" class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 outline-none" placeholder="可輸入聯絡提示或崗位備註..."></textarea>
                                 <button onclick="saveSelectionRemark()" class="w-full bg-amber-50 hover:bg-amber-100 text-amber-700 text-xs font-bold py-2 rounded-lg transition-all border border-amber-200 mb-2">保存資料</button>
-                                <button id="toggleDeletePostBtn" onclick="togglePostDeletion()" class="hidden w-full bg-red-50 hover:bg-red-100 text-red-600 text-xs font-bold py-2 rounded-lg transition-all border border-red-200">將此崗位標記為已撤銷 (Hide from Current)</button>
+                                <button id="toggleDeletePostBtn" onclick="togglePostDeletion()" class="hidden w-full bg-red-50 hover:bg-red-100 text-red-600 text-xs font-bold py-2 rounded-lg transition-all border border-red-200">將此崗位標記為「已撤銷」 (Mark as Obsolete)</button>
                             </div>
                         </div>
 
@@ -574,18 +574,18 @@
                     (parseDateKey(a.date) || '').localeCompare(parseDateKey(b.date) || '')
                 );
                 chronoRecords.forEach(r => {
-                    const fromKey = (r.from_post || '').trim() + '|' + (r.from_dept || '').trim();
-                    const toKey = (r.to_post || '').trim() + '|' + (r.to_dept || '').trim();
-                    if (fromKey !== '|') postState.set(fromKey, { status: 'vacant', holder: '', record: r });
-                    if (toKey !== '|') postState.set(toKey, { status: 'occupied', holder: r.name, record: r });
+                    const fromKey = getRoleKey(r.from_post, r.from_dept);
+                    const toKey = getRoleKey(r.to_post, r.to_dept);
+                    if (fromKey !== '||') postState.set(fromKey, { status: 'vacant', holder: '', record: r });
+                    if (toKey !== '||') postState.set(toKey, { status: 'occupied', holder: r.name, record: r });
                 });
 
                 const postHeaders = ['職位 (Post)', '部門 (Department)', '狀態 (Status)', '現任 (Holder)', '崗位備註 (Remark)'];
                 const allPostKeys = new Set([...postState.keys(), ...Object.keys(roleNotes||{}), ...Object.keys(postOverrides||{})]);
-                allPostKeys.delete('|');
+                allPostKeys.delete('||');
 
                 const postRows = [postHeaders, ...[...allPostKeys].map(key => {
-                    const parts = key.split('|');
+                    const parts = key.split('||');
                     const post = parts[0] || '';
                     const dept = parts[1] || '';
                     const computed = postState.get(key) || { status: 'vacant', holder: '' };
@@ -685,7 +685,7 @@ const payload = JSON.stringify({
                         const s = (row['狀態 (Status)'] || row['Status'] || '').toString().trim();
                         const rm = (row['崗位備註 (Remark)'] || row['Remark'] || '').toString().trim();
                         if (p || d) {
-                            const key = p + '|' + d;
+                            const key = getRoleKey(p, d);
                             if (rm) roleNotes[key] = rm;
                             if (s === 'deleted') postOverrides[key] = 'deleted';
                         }
@@ -710,6 +710,10 @@ const colleagueSheetName = workbook.SheetNames.find(n => n === 'Colleagues');
 
                 localStorage.setItem('sys_person_notes_pro', JSON.stringify(personNotes));
                 localStorage.setItem('sys_person_images_pro', JSON.stringify(personImages));
+                localStorage.setItem('sys_person_nicknames_pro', JSON.stringify(personNicknames));
+                localStorage.setItem('sys_role_notes_pro', JSON.stringify(roleNotes));
+                localStorage.setItem('sys_post_overrides', JSON.stringify(postOverrides));
+
                 saveAndSync();
                 renderDatabaseTable();
 
@@ -969,7 +973,7 @@ const colleagueSheetName = workbook.SheetNames.find(n => n === 'Colleagues');
                         delBtn.textContent = '取消撤銷標記 (Restore)';
                         delBtn.className = 'w-full bg-emerald-50 hover:bg-emerald-100 text-emerald-600 text-xs font-bold py-2 rounded-lg transition-all border border-emerald-200 mt-2';
                     } else {
-                        delBtn.textContent = '將此崗位標記為「已撤銷」 (Hide from Current)';
+                        delBtn.textContent = '將此崗位標記為「已撤銷」 (Mark as Obsolete)';
                         delBtn.className = 'w-full bg-red-50 hover:bg-red-100 text-red-600 text-xs font-bold py-2 rounded-lg transition-all border border-red-200 mt-2';
                     }
                 }
@@ -977,6 +981,30 @@ const colleagueSheetName = workbook.SheetNames.find(n => n === 'Colleagues');
             }
 
             panel.classList.add('hidden');
+        }
+
+        function togglePostDeletion() {
+            if (historyTarget.type !== 'role') return;
+            const key = getRoleKey(historyTarget.value, historyTarget.dept || '');
+            if (postOverrides[key] === 'deleted') {
+                delete postOverrides[key];
+                addLog(`恢復崗位：${historyTarget.value}`, 'info');
+            } else {
+                postOverrides[key] = 'deleted';
+                addLog(`標記崗位已撤銷：${historyTarget.value}`, 'info');
+            }
+            localStorage.setItem('sys_post_overrides', JSON.stringify(postOverrides));
+            updateSelectionRemarkPanel();
+            if (document.getElementById('currentTableBody')) renderCurrentTable();
+            if (document.getElementById('historyTableContainer')) renderHistoryView(); // To update the title badge
+
+            // 自動同步到 Google Sheets (Auto-sync to Google Sheets)
+            if (typeof saveAllToSheets === 'function') {
+                const gdriveUrl = document.getElementById('gdriveLink') ? document.getElementById('gdriveLink').value.trim() : '';
+                if (gdriveUrl && gdriveUrl.includes('script.google.com')) {
+                    saveAllToSheets();
+                }
+            }
         }
 
         function saveSelectionRemark() {
@@ -1013,8 +1041,16 @@ const colleagueSheetName = workbook.SheetNames.find(n => n === 'Colleagues');
                 else delete roleNotes[key];
                 
                 localStorage.setItem('sys_post_overrides', JSON.stringify(postOverrides));
-                localStorage.setItem('sys_role_notes_pro', JSON.stringify(roleNotes));localStorage.setItem('sys_role_notes_pro', JSON.stringify(roleNotes));
+                localStorage.setItem('sys_role_notes_pro', JSON.stringify(roleNotes));
                 addLog(`已保存崗位備註：${historyTarget.value} (${historyTarget.dept || ''})`, 'info');
+            }
+
+            // 自動同步到 Google Sheets (Auto-sync to Google Sheets)
+            if (typeof saveAllToSheets === 'function') {
+                const gdriveUrl = document.getElementById('gdriveLink') ? document.getElementById('gdriveLink').value.trim() : '';
+                if (gdriveUrl && gdriveUrl.includes('script.google.com')) {
+                    saveAllToSheets();
+                }
             }
         }
 
@@ -1378,8 +1414,8 @@ Return ONLY a raw JSON array. Fields: name, from_post, from_dept, to_post, to_de
                 const dateVal = parseDateKey(r.date) || '';
 
                 // LEAVE event
-                const fromKey = (r.from_post || '').trim() + '|' + (r.from_dept || '').trim();
-                if (fromKey !== '|') {
+                const fromKey = getRoleKey(r.from_post, r.from_dept);
+                if (fromKey !== '||') {
                     const existing = postState.get(fromKey);
                     if (!existing || dateVal > existing.dateVal) {
                         postState.set(fromKey, { status: 'vacant', action: 'LEAVE', dateVal: dateVal, record: r, to_post: r.from_post, to_dept: r.from_dept, lastDate: r.date });
@@ -1387,8 +1423,8 @@ Return ONLY a raw JSON array. Fields: name, from_post, from_dept, to_post, to_de
                 }
 
                 // JOIN event
-                const toKey = (r.to_post || '').trim() + '|' + (r.to_dept || '').trim();
-                if (toKey !== '|') {
+                const toKey = getRoleKey(r.to_post, r.to_dept);
+                if (toKey !== '||') {
                     const existing = postState.get(toKey);
                     if (!existing || dateVal >= existing.dateVal) {
                         // JOIN overrides LEAVE on the same day (>=)
@@ -1399,29 +1435,31 @@ Return ONLY a raw JSON array. Fields: name, from_post, from_dept, to_post, to_de
 
             // Format into rows
             let rows = Array.from(postState.entries()).map(([key, state]) => {
-                if (postOverrides[key] === 'deleted') return null; // Skip deleted posts
+                const isDeleted = postOverrides[key] === 'deleted';
                 return {
-                    isVacant: state.status === 'vacant',
-                    name: state.status === 'vacant' ? '' : state.record.name,
+                    isVacant: state.status === 'vacant' && !isDeleted,
+                    isDeleted: isDeleted,
+                    name: state.status === 'vacant' || isDeleted ? '' : state.record.name,
                     to_post: state.to_post,
                     to_dept: state.to_dept,
                     date: state.lastDate,
                     posting_notice: state.record.posting_notice,
                     rawRecord: state.record
                 };
-            }).filter(Boolean);
+            });
 
             // Step 2: Filter by search
             if (search) {
                 rows = rows.filter(r => {
                     const note = (personNotes[r.name] || '').toLowerCase();
                     const nick = (personNicknames[r.name] || '').toLowerCase();
-                    const pnote = (roleNotes[`${(r.to_post||'').trim()}|${(r.to_dept||'').trim()}`] || '').toLowerCase();
+                    const pnote = (roleNotes[getRoleKey(r.to_post, r.to_dept)] || '').toLowerCase();
                     return (r.name || '').toLowerCase().includes(search) ||
                            (r.to_post || '').toLowerCase().includes(search) ||
                            (r.to_dept || '').toLowerCase().includes(search) ||
                            (r.posting_notice || '').toLowerCase().includes(search) ||
                            (r.isVacant && 'vacant懸空懸空'.includes(search)) ||
+                           (r.isDeleted && 'obsolete已撤銷撤銷'.includes(search)) ||
                            nick.includes(search) || note.includes(search) || pnote.includes(search);
                 });
             }
@@ -1488,20 +1526,25 @@ Return ONLY a raw JSON array. Fields: name, from_post, from_dept, to_post, to_de
 
             // --- DESKTOP VIEW RENDERING ---
             rows.forEach(r => {
-                const img = r.isVacant ? '' : (personImages[r.name] || '');
-                const nick = r.isVacant ? '' : (personNicknames[r.name] || '');
+                const img = (r.isVacant || r.isDeleted) ? '' : (personImages[r.name] || '');
+                const nick = (r.isVacant || r.isDeleted) ? '' : (personNicknames[r.name] || '');
                 let avatarHtml = '';
-                if (!r.isVacant) {
+                if (!r.isVacant && !r.isDeleted) {
                     avatarHtml = img
                         ? `<img src="${img}" class="w-8 h-8 rounded-full object-cover inline-block mr-2 align-middle" alt="">`
                         : `<span class="w-8 h-8 rounded-full bg-blue-100 text-blue-600 text-xs font-bold inline-flex items-center justify-center mr-2 align-middle">${(r.name || '?')[0]}</span>`;
                 }
 
                 const tr = document.createElement('tr');
-                tr.className = `hover:bg-slate-50 transition-colors ${r.isVacant ? 'bg-amber-50/30' : ''}`;
+                tr.className = `hover:bg-slate-50 transition-colors ${r.isDeleted ? 'bg-slate-100/50 opacity-60' : (r.isVacant ? 'bg-amber-50/30' : '')}`;
 
                 let nameContent = '';
-                if (r.isVacant) {
+                if (r.isDeleted) {
+                    nameContent = `<span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-slate-100 text-slate-500 text-xs font-bold border border-slate-200">
+                        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636"></path></svg>
+                        已撤銷 (Obsolete)
+                    </span>`;
+                } else if (r.isVacant) {
                     nameContent = `<span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-amber-50 text-amber-700 text-xs font-bold border border-amber-200">
                         <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
                         懸空 (Vacant)
@@ -1511,7 +1554,7 @@ Return ONLY a raw JSON array. Fields: name, from_post, from_dept, to_post, to_de
                 }
 
                 tr.innerHTML = `
-                    <td class="px-6 py-4 font-bold ${r.isVacant ? '' : 'text-blue-600 cursor-pointer hover:underline'} whitespace-nowrap" ${r.isVacant ? '' : `onclick="viewHistory('name', '${escapeJsHtml(r.name)}')"`}>
+                    <td class="px-6 py-4 font-bold ${(r.isVacant || r.isDeleted) ? '' : 'text-blue-600 cursor-pointer hover:underline'} whitespace-nowrap" ${(r.isVacant || r.isDeleted) ? '' : `onclick="viewHistory('name', '${escapeJsHtml(r.name)}')"`}>
                         ${nameContent}
                     </td>
                     <td class="px-6 py-4 cursor-pointer hover:text-blue-500" onclick="viewHistory('role', '${escapeJsHtml(r.to_post)}', '${escapeJsHtml(r.to_dept)}')">
@@ -1535,23 +1578,27 @@ Return ONLY a raw JSON array. Fields: name, from_post, from_dept, to_post, to_de
             if (currentCardBody) {
                 currentCardBody.innerHTML = '';
                 rows.forEach(r => {
-                    const img = r.isVacant ? '' : (personImages[r.name] || '');
-                    const nick = r.isVacant ? '' : (personNicknames[r.name] || '');
+                    const img = (r.isVacant || r.isDeleted) ? '' : (personImages[r.name] || '');
+                    const nick = (r.isVacant || r.isDeleted) ? '' : (personNicknames[r.name] || '');
                     let avatarHtml = '';
 
-                    if (!r.isVacant) {
+                    if (r.isDeleted) {
+                        avatarHtml = `<div class="w-10 h-10 rounded-full bg-slate-100 text-slate-400 text-sm flex items-center justify-center shrink-0"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636"></path></svg></div>`;
+                    } else if (r.isVacant) {
+                        avatarHtml = `<div class="w-10 h-10 rounded-full bg-amber-100 text-amber-600 text-sm flex items-center justify-center shrink-0"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg></div>`;
+                    } else {
                         avatarHtml = img
                             ? `<img src="${img}" class="w-10 h-10 rounded-full object-cover shrink-0" alt="">`
                             : `<div class="w-10 h-10 rounded-full bg-blue-100 text-blue-600 text-sm font-bold flex items-center justify-center shrink-0">${(r.name || '?')[0]}</div>`;
-                    } else {
-                        avatarHtml = `<div class="w-10 h-10 rounded-full bg-amber-100 text-amber-600 text-sm flex items-center justify-center shrink-0"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg></div>`;
                     }
 
                     const div = document.createElement('div');
-                    div.className = `p-4 flex gap-4 bg-white items-center border-b border-slate-50 ${r.isVacant ? 'bg-amber-50/20' : ''}`;
+                    div.className = `p-4 flex gap-4 bg-white items-center border-b border-slate-50 ${r.isDeleted ? 'bg-slate-100/50 opacity-60' : (r.isVacant ? 'bg-amber-50/20' : '')}`;
 
                     let nameContent = '';
-                    if (r.isVacant) {
+                    if (r.isDeleted) {
+                        nameContent = `<div class="font-bold text-slate-500 text-base">已撤銷 (Obsolete)</div>`;
+                    } else if (r.isVacant) {
                         nameContent = `<div class="font-bold text-amber-700 text-base">懸空 (Vacant)</div>`;
                     } else {
                         nameContent = `<div class="font-bold text-blue-600 text-base cursor-pointer hover:underline" onclick="viewHistory('name', '${escapeJsHtml(r.name)}')">${escapeHtml(r.name)}${nick ? ` <span class="text-slate-400 font-normal ml-1 text-sm">(${escapeHtml(nick)})</span>` : ''}</div>`;
@@ -1689,9 +1736,16 @@ Return ONLY a raw JSON array. Fields: name, from_post, from_dept, to_post, to_de
             if (!focusNameEl || !focusTypeEl || !historyCountEl || !historyTitleEl || !historyTableContainerEl || !deptMainPanelEl || !tbody) return;
 
             if (historyTarget.type === 'role') {
-                focusNameEl.innerText = historyTarget.dept
+                const key = getRoleKey(historyTarget.value, historyTarget.dept || '');
+                const isDeleted = postOverrides[key] === 'deleted';
+                const baseName = historyTarget.dept
                     ? `${historyTarget.value} (${historyTarget.dept})`
                     : historyTarget.value;
+                if (isDeleted) {
+                    focusNameEl.innerHTML = `${escapeHtml(baseName)} <span class="ml-2 inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-md bg-slate-100 text-slate-500 text-sm font-bold border border-slate-200 align-middle"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636"></path></svg>已撤銷 (Obsolete)</span>`;
+                } else {
+                    focusNameEl.innerText = baseName;
+                }
             } else {
                 const nick = personNicknames[historyTarget.value]; focusNameEl.innerText = nick ? `${historyTarget.value} (${nick})` : historyTarget.value;
             }
@@ -1932,6 +1986,37 @@ Return ONLY a raw JSON array. Fields: name, from_post, from_dept, to_post, to_de
                     return row;
                 });
 
+                // Build Posts rows natively
+                const postState = new Map();
+                const chronoRecords = [...records].sort((a, b) => 
+                    (parseDateKey(a.date) || '').localeCompare(parseDateKey(b.date) || '')
+                );
+                chronoRecords.forEach(r => {
+                    const fromKey = getRoleKey(r.from_post, r.from_dept);
+                    const toKey = getRoleKey(r.to_post, r.to_dept);
+                    if (fromKey !== '||') postState.set(fromKey, { status: 'vacant', holder: '', record: r });
+                    if (toKey !== '||') postState.set(toKey, { status: 'occupied', holder: r.name, record: r });
+                });
+
+                const allPostKeys = new Set([...postState.keys(), ...Object.keys(roleNotes||{}), ...Object.keys(postOverrides||{})]);
+                allPostKeys.delete('||');
+
+                const postRows = [...allPostKeys].map(key => {
+                    const parts = key.split('||');
+                    const post = parts[0] || '';
+                    const dept = parts[1] || '';
+                    const computed = postState.get(key) || { status: 'vacant', holder: '' };
+                    let status = computed.status;
+                    if (postOverrides[key] === 'deleted') status = 'deleted';
+                    return {
+                        '職位 (Post)': post,
+                        '部門 (Department)': dept,
+                        '狀態 (Status)': status,
+                        '現任 (Holder)': status === 'occupied' ? computed.holder : '',
+                        '崗位備註 (Remark)': (roleNotes||{})[key] || ''
+                    };
+                });
+
                 const recordsWs = XLSX.utils.json_to_sheet(recordRows.length ? recordRows : [{
                     '姓名 (Name)': '',
                     '原職 (From Post)': '',
@@ -1952,9 +2037,18 @@ Return ONLY a raw JSON array. Fields: name, from_post, from_dept, to_post, to_de
                     '人物相片資料_1': ''
                 }]);
 
+                const postsWs = XLSX.utils.json_to_sheet(postRows.length ? postRows : [{
+                    '職位 (Post)': '',
+                    '部門 (Department)': '',
+                    '狀態 (Status)': '',
+                    '現任 (Holder)': '',
+                    '崗位備註 (Remark)': ''
+                }]);
+
                 const wb = XLSX.utils.book_new();
                 XLSX.utils.book_append_sheet(wb, recordsWs, 'Records');
                 XLSX.utils.book_append_sheet(wb, colleaguesWs, 'Colleagues');
+                XLSX.utils.book_append_sheet(wb, postsWs, 'Posts');
                 XLSX.writeFile(wb, `_Posting_Export_${new Date().toISOString().slice(0,10)}.xlsx`);
                 addLog('Excel 已成功導出。', 'info');
             } catch (err) {
@@ -2045,6 +2139,14 @@ Return ONLY a raw JSON array. Fields: name, from_post, from_dept, to_post, to_de
         // --- PERSISTENCE ---
         function saveAndSync() {
             localStorage.setItem('sys_posting_records_pro', JSON.stringify(records));
+
+            // 自動同步到 Google Sheets (Auto-sync to Google Sheets)
+            if (typeof saveAllToSheets === 'function') {
+                const gdriveUrl = document.getElementById('gdriveLink') ? document.getElementById('gdriveLink').value.trim() : '';
+                if (gdriveUrl && gdriveUrl.includes('script.google.com')) {
+                    saveAllToSheets();
+                }
+            }
         }
 
         function clearAllRecords() {
@@ -2057,7 +2159,7 @@ Return ONLY a raw JSON array. Fields: name, from_post, from_dept, to_post, to_de
     </script>
     <input type="file" id="excelImport" accept=".xlsx, .xls" class="hidden" onchange="importFromExcel(event)" />
 
-    <footer class="max-w-7xl mx-auto px-6 py-6 text-center text-xs text-slate-400">Copyright (c) Westdoor Streetson 2026 (v2.71)</footer>
+    <footer class="max-w-7xl mx-auto px-6 py-6 text-center text-xs text-slate-400">Copyright (c) Westdoor Streetson 2026 (v2.79)</footer>
 
     <script>
     document.addEventListener('DOMContentLoaded', function() {
