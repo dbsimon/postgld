@@ -246,7 +246,15 @@ function buildRecordIndex(records) {
  */
 function validateAllRecords(records, options) {
   options = options || {};
-  var adminOverride = options.adminOverride || {};
+  var adminOverrideRaw = options.adminOverride || {};
+
+  // Normalize override keys to strings for bulletproof access
+  var adminOverride = {};
+  var overrideKeys = Object.keys(adminOverrideRaw);
+  for (var oi = 0; oi < overrideKeys.length; oi++) {
+    var ok = overrideKeys[oi];
+    if (adminOverrideRaw[ok]) adminOverride[String(ok)] = true;
+  }
 
   if (!records || records.length === 0) {
     return { summary: { total: 0, ok: 0, warning: 0, error: 0 }, results: [], errorsBlocking: 0 };
@@ -378,10 +386,12 @@ function validateAllRecords(records, options) {
       }
     }
 
-    // Count
-    if (finalSeverity === VALIDATION_SEVERITY.ERROR) {
+    // Count — overridden records always count as ok regardless of finalSeverity
+    if (isOverridden) {
+      summary.ok++;
+    } else if (finalSeverity === VALIDATION_SEVERITY.ERROR) {
       summary.error++;
-      if (!isOverridden) errorsBlocking++;
+      errorsBlocking++;
     } else if (finalSeverity === VALIDATION_SEVERITY.WARNING) {
       summary.warning++;
     } else {
@@ -413,6 +423,16 @@ function validateSingleInContext(rec, allRecords, indexInArray) {
 function formatValidationIssues(issues) {
   if (!issues || issues.length === 0) return '';
   return issues.map(function(iss) { return '[' + iss.ruleId + '] ' + iss.message; }).join('; ');
+}
+
+function _countableActiveIssues(issues) {
+  if (!issues || issues.length === 0) return { error: 0, warning: 0 };
+  var e = 0, w = 0;
+  for (var i = 0; i < issues.length; i++) {
+    if (issues[i].severity === VALIDATION_SEVERITY.ERROR) e++;
+    else if (issues[i].severity === VALIDATION_SEVERITY.WARNING) w++;
+  }
+  return { error: e, warning: w };
 }
 
 /**

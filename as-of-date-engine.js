@@ -61,12 +61,11 @@ function invalidateOccupancyCache() {
 function getSortedMovements() {
   if (MOVEMENTS_SORTED) return MOVEMENTS_SORTED;
   var filtered = MovementStore.filter(function(m) {
-    if (m.supersededFlag || m.cancelledFlag) return false;
-    // Also exclude movements whose parent notice is superseded or cancelled
-    if (m.noticeId) {
-      var notice = NoticeStore[m.noticeId];
-      if (notice && (notice.status === 'superseded' || notice.status === 'cancelled')) return false;
+    if (typeof isMovementActiveForOccupancy === 'function') {
+      return isMovementActiveForOccupancy(m);
     }
+    // Fallback: filter at movement level only (no notice-level cascade)
+    if (m.supersededFlag || m.cancelledFlag) return false;
     return true;
   });
   filtered.sort(compareMovements);

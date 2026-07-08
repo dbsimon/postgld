@@ -340,7 +340,9 @@
                                         <span class="text-slate-300 text-xs font-bold">取代</span>
                                     </div>
                                     <input type="text" id="supersededPnInput" class="supersession-input" placeholder="被取代的 PN (e.g. 3/2026)" onkeyup="if(event.key==='Enter')linkSupersession()">
-                                    <button onclick="linkSupersession()" class="w-full bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-xs font-bold py-2 rounded-lg transition-all border border-indigo-200">鏈接取代關係</button>
+                                    <button onclick="linkSupersession()" class="w-full bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-xs font-bold py-2 rounded-lg transition-all border border-indigo-200">鏈接 PN 取代關係</button>
+                                    <p class="text-[9px] text-slate-400 mt-1 leading-relaxed">Movement-level: 先選定一個人，再輸入取代的 PN 和被取代的 PN，然後按下方按鈕</p>
+                                    <button onclick="linkMovementSupersessionUI()" class="w-full bg-emerald-50 hover:bg-emerald-100 text-emerald-700 text-xs font-bold py-2 rounded-lg transition-all border border-emerald-200">鏈接 Movement 取代關係</button>
                                 </div>
                                 <div id="supersessionChainContainer" class="space-y-2"></div>
                             </div>
@@ -486,7 +488,10 @@
         <div id="issuePanelFooter" class="px-5 py-3 border-t border-slate-100 bg-slate-50 shrink-0 space-y-2">
             <div class="flex gap-2">
                 <button onclick="_bulkIgnoreWarnings()" class="flex-1 bg-amber-50 hover:bg-amber-100 text-amber-700 text-[11px] font-bold py-2 rounded-lg transition-all border border-amber-200">忽略所有警告</button>
-                <button onclick="_bulkAutoLinkSupersession()" class="flex-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-[11px] font-bold py-2 rounded-lg transition-all border border-indigo-200">自動鏈接取代</button>
+                <button onclick="_bulkAutoLinkSupersession()" class="flex-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-[11px] font-bold py-2 rounded-lg transition-all border border-indigo-200">自動鏈接取代 (PN)</button>
+            </div>
+            <div class="flex gap-2">
+                <button onclick="_bulkAutoLinkMovementSupersession()" class="flex-1 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 text-[11px] font-bold py-2 rounded-lg transition-all border border-emerald-200">自動鏈接取代 (Movement)</button>
             </div>
             <button onclick="_bulkRevalidate()" class="w-full bg-blue-50 hover:bg-blue-100 text-blue-700 text-[11px] font-bold py-2 rounded-lg transition-all border border-blue-200">重新驗證</button>
         </div>

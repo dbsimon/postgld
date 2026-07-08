@@ -9,6 +9,8 @@ let postOverrides = JSON.parse(localStorage.getItem('sys_post_overrides') || '{}
 let roleNotes = JSON.parse(localStorage.getItem('sys_role_notes_pro')) || {};
 let personImages = JSON.parse(localStorage.getItem('sys_person_images_pro')) || {};
 
+let actingTagOverrides = JSON.parse(localStorage.getItem('sys_acting_tag_overrides') || '{}');
+
 let syncState = {
     status: 'draft',
     lastSync: null,
@@ -17,17 +19,20 @@ let syncState = {
     error: null
 };
 
+let _remoteSyncInProgress = false;
+let _startupSyncComplete = false;
+
 let _validationCache = null;
 let _adminOverrides = (function() { try { return JSON.parse(localStorage.getItem('sys_admin_overrides_pro') || '{}'); } catch(e) { return {}; } })();
 
 // Notice-status badge helpers — used across all table renderers
 function _renderNoticeStatusBadge(pnRaw, record) {
-    var status = 'active';
+    var status = 'valid';
     if (typeof getMovementStatus === 'function') {
         var noticeId = hashId((pnRaw || '').trim());
         var mov = sliceMovementForStatusCheck(record, noticeId);
         if (mov) status = getMovementStatus(mov);
-        else if (noticeId && NoticeStore[noticeId]) status = NoticeStore[noticeId].status || 'active';
+        else if (noticeId && NoticeStore[noticeId]) status = NoticeStore[noticeId].status || 'valid';
     } else {
         // Fallback: check remark-based parsing
         if (record && record.supersededFlag) status = 'superseded';
@@ -36,7 +41,7 @@ function _renderNoticeStatusBadge(pnRaw, record) {
 
     var meta = { label: '', cssClass: '', icon: '', title: '' };
     switch (status) {
-        case 'active':   meta = { label: 'ACTIVE',     cssClass: 'notice-badge-active',      icon: '●', title: 'Movement is active' }; break;
+        case 'valid':   meta = { label: 'VALID',     cssClass: 'notice-badge-active',      icon: '●', title: 'Movement is valid' }; break;
         case 'future':   meta = { label: 'FUTURE',     cssClass: 'notice-badge-future',      icon: '○', title: 'Takes effect on ' + (record.date || 'TBD') }; break;
         case 'superseded': meta = { label: 'SUPERSEDED', cssClass: 'notice-badge-superseded', icon: '↻', title: showSupersessionTitle(pnRaw) }; break;
         case 'cancelled': meta = { label: 'CANCELLED',  cssClass: 'notice-badge-cancelled',  icon: '✕', title: 'Movement has been cancelled' }; break;
@@ -54,11 +59,47 @@ function showSupersessionTitle(pnRaw) {
     return 'This notice has been superseded';
 }
 
+function _resolveCanonicalMovement(record) {
+    if (!record || typeof MovementStore === 'undefined') return null;
+    var recName = (record.name || '').trim();
+    var recDate = record.date || '';
+    var recPn   = (record.posting_notice || '').trim();
+    var recFromPost = (record.from_post || '').trim();
+    var recToPost   = (record.to_post || '').trim();
+    var recToDept   = (record.to_dept || '').trim();
+
+    var best = null, bestScore = -1;
+    for (var i = 0; i < MovementStore.length; i++) {
+        var m = MovementStore[i];
+        var pn = NoticeStore[m.noticeId] ? NoticeStore[m.noticeId].noticeNumber : '';
+        var name = PersonStore[m.personId] ? PersonStore[m.personId].name : '';
+        var toDept = DeptStore[m.toDeptId] ? DeptStore[m.toDeptId].name : '';
+
+        if ((pn || '').trim() !== recPn) continue;
+        if (name !== recName) continue;
+
+        var score = 0;
+        if (m.effectiveDate === recDate) score += 10;
+        if (toDept === recToDept) score += 5;
+        var toPostTitle = PostStore[m.toPostId] ? PostStore[m.toPostId].title : '';
+        if (toPostTitle === recToPost) score += 3;
+        var fromPostTitle = PostStore[m.fromPostId] ? PostStore[m.fromPostId].title : '';
+        if (fromPostTitle === recFromPost) score += 1;
+
+        if (score > bestScore) { bestScore = score; best = m; }
+    }
+    return best;
+}
+
 function sliceMovementForStatusCheck(record, noticeId) {
     if (!record || !noticeId) return null;
+    var canonical = _resolveCanonicalMovement(record);
+    if (canonical) return canonical;
+    // Fallback: build fake object with whatever we have
     var dateKey = typeof _cachedDateKey === 'function' ? _cachedDateKey(record.date) : '';
     return {
         noticeId: noticeId,
+        movementId: (record._movementId || ''),
         effectiveDateKey: dateKey || '',
         supersededFlag: record.supersededFlag || false,
         cancelledFlag: record.cancelledFlag || false,
@@ -71,7 +112,7 @@ function sliceMovementForStatusCheck(record, noticeId) {
 //  PERFORMANCE INFRASTRUCTURE  — memo, debounce, idle, cache invalidation
 // ═══════════════════════════════════════════════════════════════════════════
 
-var _currentTab = 'current';
+var _currentTab = null;
 var _renderDirty = { database: true, current: true, history: true };
 var _dateKeyCache = {};
 
@@ -140,8 +181,6 @@ function _getMemoCurrentRows() {
         if (typeof getOccupancySnapshot === 'function') {
             snapshot = getOccupancySnapshot(asOfDate);
         }
-        // Only use occupancy engine if it returned real entries; fall back to
-        // flat-records path when canonical stores aren't seeded yet (empty snapshot).
         var hasSnapshotEntries = false;
         if (snapshot) {
             for (var _sk in snapshot) { if (snapshot.hasOwnProperty(_sk)) { hasSnapshotEntries = true; break; } }
@@ -149,21 +188,34 @@ function _getMemoCurrentRows() {
         if (hasSnapshotEntries && typeof occupancyToRows === 'function') {
             rows = occupancyToRows(snapshot, currentSortState.key, currentSortState.direction);
         } else {
-            // legacy fallback (rare path)
+            // Fallback: replay movements sorted chronologically for each post,
+            // keeping only the latest join/leave as of the selected date.
+            var sortedRecs = records.slice().sort(function(a, b) {
+                var da = _cachedDateKey(a.date) || '';
+                var db = _cachedDateKey(b.date) || '';
+                if (da !== db) return da.localeCompare(db);
+                var pnA = String(a.posting_notice || '').match(/(\d+)\s*\/\s*(\d{4})/);
+                var pnB = String(b.posting_notice || '').match(/(\d+)\s*\/\s*(\d{4})/);
+                var sa = pnA ? parseInt(pnA[2]) * 10000 + parseInt(pnA[1]) : 0;
+                var sb = pnB ? parseInt(pnB[2]) * 10000 + parseInt(pnB[1]) : 0;
+                return sa - sb;
+            });
             var postState = new Map();
-            records.forEach(function(r) {
+            for (var si = 0; si < sortedRecs.length; si++) {
+                var r = sortedRecs[si];
                 var dv = _cachedDateKey(r.date) || '';
+                if (dv > asOfDate) continue;
                 var fk = getRoleKey(r.from_post, r.from_dept);
                 if (fk !== '||') {
                     var ex = postState.get(fk);
-                    if (!ex || dv > ex.dateVal) postState.set(fk, { status: 'vacant', action: 'LEAVE', dateVal: dv, record: r, to_post: r.from_post, to_dept: r.from_dept, lastDate: r.date });
+                    if (!ex || dv >= ex.dateVal) postState.set(fk, { status: 'vacant', action: 'LEAVE', dateVal: dv, record: r, to_post: r.from_post, to_dept: r.from_dept, lastDate: r.date });
                 }
                 var tk = getRoleKey(r.to_post, r.to_dept);
                 if (tk !== '||') {
                     var ex2 = postState.get(tk);
                     if (!ex2 || dv >= ex2.dateVal) postState.set(tk, { status: 'occupied', action: 'JOIN', dateVal: dv, record: r, to_post: r.to_post, to_dept: r.to_dept, lastDate: r.date });
                 }
-            });
+            }
             rows = Array.from(postState.entries()).map(function(e) {
                 var k = e[0], st = e[1];
                 var isDel = postOverrides[k] === 'deleted';
@@ -300,6 +352,11 @@ function _markAllDirty() {
 
 function revalidateAll() {
     if (typeof validateAllRecords !== 'function') return;
+    // Always re-read overrides from localStorage to ensure freshness
+    try {
+        var stored = JSON.parse(localStorage.getItem('sys_admin_overrides_pro') || '{}');
+        _adminOverrides = stored;
+    } catch(e) { _adminOverrides = {}; }
     _validationCache = validateAllRecords(records, { adminOverride: _adminOverrides });
     _buildValidationIndex();
     updateValidationBadge();
@@ -355,12 +412,14 @@ function isAdmin() {
 }
 
 function updateValidationBadge() {
-    if (!_validationCache) return;
+    if (!_validationCache || !_validationCache.summary) {
+        revalidateAll();
+        return;
+    }
     var badge = document.getElementById('validationSummaryBadge');
     if (!badge) return;
     var s = _validationCache.summary;
     badge.classList.remove('hidden', 'error-pulse');
-    // Only show diagnostic content when admin is active
     if (!isAdmin()) {
         badge.classList.add('hidden');
         return;
@@ -391,6 +450,10 @@ function toggleValidationOverride(recordIndex) {
     var key = String(recordIndex);
     _adminOverrides[key] = !_adminOverrides[key];
     try { localStorage.setItem('sys_admin_overrides_pro', JSON.stringify(_adminOverrides)); } catch(e) {}
+    // Force re-read from localStorage to ensure cross-function consistency
+    try {
+        _adminOverrides = JSON.parse(localStorage.getItem('sys_admin_overrides_pro') || '{}');
+    } catch(e) { _adminOverrides = {}; }
     revalidateAll();
     showToast(_adminOverrides[key] ? 'Admin override: issue resolved (record #' + (recordIndex + 1) + ')' : 'Override removed (record #' + (recordIndex + 1) + ')', 'info', 3000);
 }
@@ -450,9 +513,9 @@ function updateSyncBadge() {
         badge.classList.add('hidden');
         return;
     }
-    badge.classList.remove('hidden', 'synced', 'draft', 'failed', 'loading');
+    badge.classList.remove('hidden', 'synced', 'draft', 'failed', 'loading', 'fetching');
     badge.classList.add(syncState.status);
-    var labels = { synced: '已同步', draft: '變更未儲存', failed: '同步失敗', loading: '同步中…', stale: '遠端較新' };
+    var labels = { synced: '已同步', draft: '變更未儲存', failed: '同步失敗', loading: '儲存中…', fetching: '擷取雲端…', stale: '遠端較新' };
     badge.textContent = labels[syncState.status] || '';
     badge.title = syncState.lastSync ? '上次同步: ' + syncState.lastSync : '';
     if (syncState.localCount) badge.title += ' | 本地: ' + syncState.localCount + ' 筆';
@@ -460,6 +523,9 @@ function updateSyncBadge() {
 }
 
 function setSyncStatus(status, remoteCount, error) {
+    if (status === 'draft' && _remoteSyncInProgress) {
+        return;
+    }
     syncState.status = status;
     if (remoteCount !== undefined) syncState.remoteCount = remoteCount;
     syncState.localCount = (records || []).length;
@@ -538,16 +604,16 @@ window.onload = function() {
     document.getElementById('apiKey').value = savedKey;
 
     var savedGdrive = localStorage.getItem('sys_gdrive_link') || '';
+    var hasRemoteUrl = false;
     if (savedGdrive) {
         document.getElementById('gdriveLink').value = savedGdrive;
-        autoSyncFromGdrive(savedGdrive);
+        hasRemoteUrl = !!convertGdriveLink(savedGdrive);
     }
 
     if (sessionStorage.getItem('posting_admin_mode') === '1') {
         applyAdminMode();
     }
 
-    // Seed canonical stores synchronously so the current table has data on first render
     if (typeof syncCanonicalStores === 'function') syncCanonicalStores(records);
     if (typeof resolveNoticeStatuses === 'function') resolveNoticeStatuses();
 
@@ -555,10 +621,19 @@ window.onload = function() {
     toggleDbSearchClearBtn();
     switchTab('current');
 
-    setSyncStatus('draft');
-    updateSyncBadge();
+    if (_remoteSyncInProgress) {
+    } else if (hasRemoteUrl) {
+        setSyncStatus('fetching');
+        updateSyncBadge();
+        autoSyncFromGdrive(savedGdrive);
+    } else if (records.length > 0) {
+        setSyncStatus('draft');
+        updateSyncBadge();
+    } else {
+        setSyncStatus('draft');
+        updateSyncBadge();
+    }
 
-    // Background: re-validate and refresh stores (idempotent, picks up any async changes)
     _scheduleIdle(function() {
         if (typeof syncCanonicalStores === 'function') syncCanonicalStores(records);
         if (typeof resolveNoticeStatuses === 'function') resolveNoticeStatuses();
@@ -597,8 +672,7 @@ function switchTab(tabId) {
         return;
     }
 
-    if (_currentTab === tabId && tabId !== 'history') return;
-
+    var alreadyActive = (_currentTab === tabId && tabId !== 'history');
     _currentTab = tabId;
 
     ['upload', 'database', 'current', 'history', 'manual'].forEach(function(id) {
@@ -626,6 +700,8 @@ function switchTab(tabId) {
         var mL = activeMob ? activeMob.querySelector('span') : null;
         if (mL) mL.classList.add('font-semibold');
     }
+
+    if (alreadyActive) return;
 
     if (tabId === 'database') _scheduleRender('db', renderDatabaseTable);
     if (tabId === 'current') _scheduleRender('cur', renderCurrentTable);
@@ -838,7 +914,8 @@ async function doSaveToSheets() {
                 Posts: postRows
             },
             auditEvents: unsyncedAudit.slice(0, 200),
-            supersessionLinks: (typeof _supersessionLinks === 'object') ? _supersessionLinks : {}
+            supersessionLinks: (typeof _supersessionLinks === 'object') ? _supersessionLinks : {},
+            movementSupersessionLinks: (typeof _movementSupersessionLinks === 'object') ? _movementSupersessionLinks : {}
         });
 
         const resp = await fetch(url, {
@@ -878,96 +955,181 @@ async function fetchFromGdrive() {
     await autoSyncFromGdrive(link);
 }
 
+function readRemoteData(json, rawLink) {
+    var result = { records: [], colleagueData: {}, postData: {} };
+
+    if (!json || typeof json !== 'object') return result;
+
+    var recordsSheet = json.Records;
+    if (Array.isArray(recordsSheet) && recordsSheet.length > 1) {
+        var headers = recordsSheet[0];
+        var colMap = {};
+        for (var hi = 0; hi < headers.length; hi++) {
+            var h = String(headers[hi] || '').trim();
+            if (h.indexOf('姓名') >= 0) colMap.name = hi;
+            else if (h.indexOf('原職') >= 0 || h.indexOf('From Post') >= 0) colMap.from_post = hi;
+            else if (h.indexOf('原部門') >= 0 || h.indexOf('From Dept') >= 0) colMap.from_dept = hi;
+            else if (h.indexOf('現職') >= 0 || h.indexOf('To Post') >= 0) colMap.to_post = hi;
+            else if (h.indexOf('現部門') >= 0 || h.indexOf('To Dept') >= 0) colMap.to_dept = hi;
+            else if (h.indexOf('生效日期') >= 0 || h.indexOf('Date') >= 0) colMap.date = hi;
+            else if (h.indexOf('備註') >= 0 || h.indexOf('Remark') >= 0) colMap.remark = hi;
+            else if (h.indexOf('PN') >= 0 || h.indexOf('Posting') >= 0) colMap.posting_notice = hi;
+            else if (h === 'Superseded' || h.indexOf('Superseded') >= 0) colMap.superseded = hi;
+        }
+        for (var ri = 1; ri < recordsSheet.length; ri++) {
+            var row = recordsSheet[ri];
+            if (!Array.isArray(row)) continue;
+            var rec = {
+                name: (colMap.name !== undefined ? String(row[colMap.name] || '') : ''),
+                from_post: (colMap.from_post !== undefined ? String(row[colMap.from_post] || '') : ''),
+                from_dept: (colMap.from_dept !== undefined ? String(row[colMap.from_dept] || '') : ''),
+                to_post: (colMap.to_post !== undefined ? String(row[colMap.to_post] || '') : ''),
+                to_dept: (colMap.to_dept !== undefined ? String(row[colMap.to_dept] || '') : ''),
+                date: (colMap.date !== undefined ? String(row[colMap.date] || '') : ''),
+                remark: (colMap.remark !== undefined ? String(row[colMap.remark] || '') : ''),
+                posting_notice: (colMap.posting_notice !== undefined ? String(row[colMap.posting_notice] || '') : ''),
+                supersededFlag: colMap.superseded !== undefined ? (String(row[colMap.superseded] || '').toUpperCase() === 'TRUE') : false
+            };
+            if (rec.name) result.records.push(rec);
+        }
+    }
+
+    var postsSheet = json.Posts;
+    if (Array.isArray(postsSheet) && postsSheet.length > 1) {
+        for (var pi = 1; pi < postsSheet.length; pi++) {
+            var prow = postsSheet[pi];
+            if (!Array.isArray(prow)) continue;
+            var p = String(prow[0] || '').trim();
+            var d = String(prow[1] || '').trim();
+            var s = String(prow[2] || '').trim();
+            var rm = String(prow[4] || '').trim();
+            if (p || d) {
+                var key = getRoleKey(p, d);
+                result.postData[key] = { post: p, dept: d, status: s, remark: rm };
+            }
+        }
+    }
+
+    var colleaguesSheet = json.Colleagues;
+    if (Array.isArray(colleaguesSheet) && colleaguesSheet.length > 1) {
+        for (var ci = 1; ci < colleaguesSheet.length; ci++) {
+            var crow = colleaguesSheet[ci];
+            if (!Array.isArray(crow)) continue;
+            var personName = String(crow[0] || '').trim();
+            var nick = String(crow[1] || '').trim();
+            var personRemark = String(crow[2] || '').trim();
+            var imgData = '';
+            for (var chi = 4; chi < crow.length; chi++) {
+                if (crow[chi]) imgData += String(crow[chi]);
+            }
+            if (personName) {
+                result.colleagueData[personName] = { nick: nick, remark: personRemark, image: imgData };
+            }
+        }
+    }
+
+    return result;
+}
+
+function applyRemoteDataToLocal(data) {
+    if (!data || !data.records) return 0;
+
+    var oldCount = records.length;
+    records = data.records;
+
+    if (typeof ensureRecordMeta === 'function') {
+        for (var sc = 0; sc < records.length; sc++) {
+            records[sc] = ensureRecordMeta(records[sc], 'gdrive-sync');
+        }
+        recordBulkAuditEvent('SYNC_DRIVE', records.length, 'sync', 'gdrive-sync');
+    }
+
+    var colleagueData = data.colleagueData || {};
+    for (var name in colleagueData) {
+        if (colleagueData.hasOwnProperty(name)) {
+            var cd = colleagueData[name];
+            if (cd.nick) personNicknames[name] = cd.nick;
+            if (cd.remark) personNotes[name] = cd.remark;
+            if (cd.image) personImages[name] = cd.image;
+        }
+    }
+
+    var postData = data.postData || {};
+    for (var key in postData) {
+        if (postData.hasOwnProperty(key)) {
+            var pd = postData[key];
+            if (pd.remark) roleNotes[key] = pd.remark;
+            if (pd.status === 'deleted') postOverrides[key] = 'deleted';
+        }
+    }
+
+    localStorage.setItem('sys_posting_records_pro', JSON.stringify(records));
+    localStorage.setItem('sys_person_nicknames_pro', JSON.stringify(personNicknames));
+    localStorage.setItem('sys_person_notes_pro', JSON.stringify(personNotes));
+    localStorage.setItem('sys_person_images_pro', JSON.stringify(personImages));
+    localStorage.setItem('sys_role_notes_pro', JSON.stringify(roleNotes));
+    localStorage.setItem('sys_post_overrides', JSON.stringify(postOverrides));
+
+    _markAllDirty();
+    _invalidateAllCaches();
+
+    if (typeof syncCanonicalStores === 'function') syncCanonicalStores(records);
+    if (typeof resolveNoticeStatuses === 'function') resolveNoticeStatuses();
+
+    return records.length;
+}
+
+function _finalizeReadSync(remoteCount) {
+    _remoteSyncInProgress = false;
+    if (!_startupSyncComplete) _startupSyncComplete = true;
+    setSyncStatus('synced', remoteCount);
+    setGdriveStatus('✓ 已同步 ' + remoteCount + ' 筆紀錄', 'text-emerald-600');
+    addLog('Sync from Google Sheets: ' + remoteCount + ' movements', 'info');
+    if (_currentTab === 'database') _scheduleRender('db', renderDatabaseTable);
+    if (_currentTab === 'current') _scheduleRender('cur', renderCurrentTable);
+    if (_currentTab === 'history' && historyTarget && historyTarget.value) renderHistoryView();
+    _scheduleIdle(function() {
+        if (typeof revalidateAll === 'function') revalidateAll();
+    });
+}
+
 async function autoSyncFromGdrive(rawLink) {
-    const parsed = convertGdriveLink(rawLink);
+    var parsed = convertGdriveLink(rawLink);
     if (!parsed) {
         setGdriveStatus('⚠ 連結格式不正確，請貼上 Apps Script Web App URL。', 'text-amber-600');
         return;
     }
-    setGdriveStatus('⟳ 正在讀取資料…', 'text-blue-500');
-    setSyncStatus('loading');
+    _remoteSyncInProgress = true;
+    setGdriveStatus('⟳ 正在讀取雲端資料…', 'text-blue-500');
+    setSyncStatus('fetching');
+
+    var timeoutId = setTimeout(function() {
+        if (_remoteSyncInProgress) {
+            setGdriveStatus('⚠ 同步時間較長，請稍候…（逾時？請檢查網絡連接）', 'text-amber-600');
+        }
+    }, 120000);
+
     try {
-        let workbook = XLSX.utils.book_new();
-
-        if (parsed.type === 'appsscript') {
-            const json = await fetchAppsScript(parsed.url);
-            for (const [sheetName, rows] of Object.entries(json)) {
-                if (sheetName === 'success' || sheetName === 'error') continue;
-                if (sheetName.startsWith('_')) continue;
-                if (!Array.isArray(rows) || rows.length === 0) continue;
-                const ws = XLSX.utils.aoa_to_sheet(rows);
-                XLSX.utils.book_append_sheet(workbook, ws, sheetName);
-            }
-        } else {
-            throw new Error('請使用 Apps Script Web App URL。');
+        var json = await fetchAppsScript(parsed.url);
+        clearTimeout(timeoutId);
+        var data = readRemoteData(json, rawLink);
+        if (data.records.length === 0) {
+            _remoteSyncInProgress = false;
+            if (!_startupSyncComplete) _startupSyncComplete = true;
+            setGdriveStatus('⚠ 雲端沒有找到紀錄資料', 'text-amber-600');
+            setSyncStatus('draft');
+            return;
         }
-
-        const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
-        const imported = XLSX.utils.sheet_to_json(firstSheet);
-        const cleaned = imported.map(item => ({
-            name: item['姓名 (Name)'] || item['Name'] || item.name || '',
-            from_post: item['原職 (From Post)'] || item['From Post'] || item.from_post || item.fromPost || '',
-            from_dept: item['原部門 (From Dept)'] || item['From Dept'] || item.from_dept || item.fromDept || '',
-            to_post: item['現職 (To Post)'] || item['To Post'] || item.to_post || item.toPost || '',
-            to_dept: item['現部門 (To Dept)'] || item['To Dept'] || item.to_dept || item.toDept || '',
-            date: item['生效日期'] || item['Date'] || item.date || '',
-            remark: item['備註 (Remark)'] || item['Remark'] || item.remark || '',
-            posting_notice: item['PN No.'] || item['Posting No.'] || item['PN'] || item.posting_notice || item.postingNotice || item.pn_no || item.pnNo || ''
-        })).filter(r => r.name);
-
-        const postsSheetName = workbook.SheetNames.find(n => n === 'Posts');
-        if (postsSheetName) {
-            const postRows = XLSX.utils.sheet_to_json(workbook.Sheets[postsSheetName]);
-            postRows.forEach(row => {
-                const p = (row['職位 (Post)'] || row['Post'] || '').toString().trim();
-                const d = (row['部門 (Department)'] || row['Dept'] || row['Department'] || '').toString().trim();
-                const s = (row['狀態 (Status)'] || row['Status'] || '').toString().trim();
-                const rm = (row['崗位備註 (Remark)'] || row['Remark'] || '').toString().trim();
-                if (p || d) {
-                    const key = getRoleKey(p, d);
-                    if (rm) roleNotes[key] = rm;
-                    if (s === 'deleted') postOverrides[key] = 'deleted';
-                }
-            });
-        }
-        const colleagueSheetName = workbook.SheetNames.find(n => n === 'Colleagues');
-        if (colleagueSheetName) {
-            const colleagueRows = XLSX.utils.sheet_to_json(workbook.Sheets[colleagueSheetName]);
-            colleagueRows.forEach(row => {
-                const personName = row['姓名 (Name)'] || row['Name'] || '';
-                const personNick = row['暱稱 (Nickname)'] || row['Nickname'] || row['暱稱'] || '';
-                const personRemark = row['人物備註'] || row['Person Remark'] || '';
-                const photoData = combineExcelSafeText(row, '人物相片資料_');
-                if (personName && personNick) personNicknames[personName] = personNick;
-                if (personName && personRemark) personNotes[personName] = personRemark;
-                if (personName && photoData) personImages[personName] = photoData;
-            });
-        }
-
-        records = cleaned;
-
-        // Stamp metadata and audit for synced records
-        if (typeof ensureRecordMeta === 'function') {
-            for (var sc = 0; sc < records.length; sc++) {
-                records[sc] = ensureRecordMeta(records[sc], 'gdrive-sync');
-            }
-            recordBulkAuditEvent('SYNC_DRIVE', cleaned.length, 'sync', 'gdrive-sync');
-        }
-
-        localStorage.setItem('sys_person_notes_pro', JSON.stringify(personNotes));
-        localStorage.setItem('sys_person_images_pro', JSON.stringify(personImages));
-        _markAllDirty();
-        _invalidateAllCaches();
-        localStorage.setItem('sys_posting_records_pro', JSON.stringify(records));
-        setSyncStatus('draft');
-        if (typeof syncCanonicalStores === 'function') syncCanonicalStores(records);
-        if (typeof resolveNoticeStatuses === 'function') resolveNoticeStatuses();
-        if (typeof revalidateAll === 'function') revalidateAll();
+        applyRemoteDataToLocal(data);
+        _finalizeReadSync(data.records.length);
     } catch (err) {
+        clearTimeout(timeoutId);
         console.error('GDrive sync error:', err);
-        const hint = `⚠ 同步失敗：${err.message}`;
+        _remoteSyncInProgress = false;
+        if (!_startupSyncComplete) _startupSyncComplete = true;
+        var hint = '⚠ 同步失敗：' + err.message;
         setGdriveStatus(hint, 'text-red-500');
-        addLog(`Google Drive 同步失敗：${err.message}`, 'error');
+        addLog('Google Drive 同步失敗：' + err.message, 'error');
         setSyncStatus('failed', undefined, err.message);
     }
 }
@@ -1408,7 +1570,9 @@ function updatePersonImagePanel() {
                 var snapshot = getOccupancySnapshot(getAsOfDateKey());
                 for (var key in snapshot) {
                     if (snapshot.hasOwnProperty(key) && snapshot[key].actingHolder && snapshot[key].actingHolder.name === historyTarget.value) {
-                        isActing = true;
+                        if (!isActingTagOverridden(snapshot[key])) {
+                            isActing = true;
+                        }
                         break;
                     }
                 }
@@ -1471,59 +1635,69 @@ function removePersonImage() {
     addLog(`已移除人物相片：${historyTarget.value}`, 'info');
 }
 
+function _persistActingOverrides() {
+    try { localStorage.setItem('sys_acting_tag_overrides', JSON.stringify(actingTagOverrides)); } catch(e) {}
+}
+
+function _getActingEntryForPerson(personName) {
+    if (!personName || typeof getOccupancySnapshot !== 'function') return null;
+    var snapshot = getOccupancySnapshot(getAsOfDateKey());
+    var keys = Object.keys(snapshot);
+    for (var i = 0; i < keys.length; i++) {
+        var e = snapshot[keys[i]];
+        if (e.actingHolder && e.actingHolder.name === personName) {
+            return { entry: e, postKey: keys[i], actingMovId: e.actingHolder.movementId || '' };
+        }
+    }
+    return null;
+}
+
+function isActingTagOverridden(rowOrEntry) {
+    if (!rowOrEntry) return false;
+    var actingMovId = rowOrEntry.actingMovId || '';
+    if (!actingMovId && rowOrEntry.actingHolder) {
+        actingMovId = rowOrEntry.actingHolder.movementId || '';
+    }
+    var postKey = rowOrEntry.postKey || '';
+    if (actingMovId && actingTagOverrides[actingMovId]) return true;
+    if (postKey && actingTagOverrides[postKey]) return true;
+    return false;
+}
+
 function markCeaseActing() {
     if (!isAdmin()) return;
     if (historyTarget.type !== 'name' || !historyTarget.value) return;
     var personName = historyTarget.value;
-    var today = new Date();
-    var dateStr = today.getDate() + '.' + (today.getMonth() + 1) + '.' + today.getFullYear();
 
-    var latestRec = records
-        .filter(function(r) { return (r.name || '').trim() === personName; })
-        .sort(function(a, b) { return parseDateKey(b.date).localeCompare(parseDateKey(a.date)); })[0];
-
-    if (!latestRec) {
-        showToast('找不到 ' + personName + ' 的任何紀錄。', 'warning');
+    var actingInfo = _getActingEntryForPerson(personName);
+    if (!actingInfo) {
+        showToast(personName + ' 目前沒有署任狀態。', 'warning');
+        var ceaseBtn = document.getElementById('ceaseActingBtn');
+        if (ceaseBtn) ceaseBtn.classList.add('hidden');
         return;
     }
 
-    var post = latestRec.to_post || '';
-    var dept = latestRec.to_dept || '';
+    var postTitle = actingInfo.entry.postTitle || '';
+    var deptName  = actingInfo.entry.deptName || '';
+    var movId = actingInfo.actingMovId;
 
-    if (!post) {
-        showToast(personName + ' 的現任崗位不明，無法生成解除署任紀錄。', 'warning');
-        return;
-    }
+    if (!confirm('確定要移除 ' + personName + ' 的署任標籤？\n\n崗位：' + postTitle + (deptName ? ' (' + deptName + ')' : '') +
+        '\n\n此操作只會隱藏 UI 上的署任標籤，不會新增或修改任何記錄。')) return;
 
-    if (!confirm('確定要為 ' + personName + ' 創建「解除署任」紀錄？\n\n崗位：' + post + (dept ? ' (' + dept + ')' : '') + '\n生效日期：' + dateStr + '\n\n系統會新增一條 remark 為 "to cease acting" 的紀錄。')) return;
+    // Set override by acting movementId, with postKey fallback
+    if (movId) actingTagOverrides[movId] = true;
+    actingTagOverrides[actingInfo.postKey] = true;
+    _persistActingOverrides();
 
-    var rec = {
-        name: personName,
-        from_post: post,
-        from_dept: dept,
-        to_post: post,
-        to_dept: dept,
-        date: dateStr,
-        posting_notice: '(ADMIN)',
-        remark: 'to cease acting (confirmed promotion - no posting notice issued)'
-    };
+    _invalidateAllCaches();
+    if (typeof invalidateOccupancyCache === 'function') invalidateOccupancyCache();
 
-    if (typeof ensureRecordMeta === 'function') {
-        rec = ensureRecordMeta(rec, 'manual');
-        recordAuditEvent('APPROVE', rec, {
-            performedBy: 'admin',
-            snapshot: null,
-            fieldsChanged: [],
-            changeReason: 'Admin marked cease-acting for confirmed promotion'
-        });
-    }
+    if (document.getElementById('currentTableBody')) _scheduleRender('cur', renderCurrentTable);
+    if (historyTarget && historyTarget.value) renderHistoryView();
+    updatePersonImagePanel();
 
-    records.unshift(rec);
-    saveAndSync();
-    updateUndoButton();
-    renderHistoryView();
-    addLog('已創建 ' + personName + ' 的解除署任紀錄 (PN: ADMIN)', 'info');
-    showToast('已解除 ' + personName + ' 的署任狀態。', 'success', 4000);
+    addLog('已移除 ' + personName + ' 的署任標籤 (movement: ' + (movId || actingInfo.postKey) + ')', 'info');
+    showToast('已移除 ' + personName + ' 的署任標籤。', 'success', 4000);
 }
 
 async function processPDF() {
@@ -1799,6 +1973,12 @@ function renderCurrentTable() {
         if (typeof isNoticeSupersededByAdmin === 'function' && r.posting_notice && r.posting_notice !== '-' && isNoticeSupersededByAdmin(r.posting_notice)) {
             curRowClass += ' superseded-row';
         }
+        if (typeof isMovementSupersededByLink === 'function' && r.rawRecord) {
+            var cMov0 = _resolveCanonicalMovement(r.rawRecord);
+            if (cMov0 && cMov0.movementId && isMovementSupersededByLink(cMov0.movementId)) {
+                curRowClass += ' superseded-row';
+            }
+        }
         tr.className = curRowClass;
 
         var nameContent = '';
@@ -1813,7 +1993,7 @@ function renderCurrentTable() {
         }
 
         var badges = '';
-        if (r.isActing) badges += '<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-bold bg-purple-100 text-purple-700 ml-1.5 align-middle">署任</span>';
+        if (r.isActing && !isActingTagOverridden(r)) badges += '<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-bold bg-purple-100 text-purple-700 ml-1.5 align-middle">署任</span>';
         if (r.onAttachment) badges += '<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-bold bg-cyan-100 text-cyan-700 ml-1 align-middle">借調</span>';
         if (r.isFutureIncoming) badges += '<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-bold bg-indigo-100 text-indigo-700 ml-1.5 align-middle">到任</span>';
 
@@ -1850,7 +2030,7 @@ function renderCurrentTable() {
             }
 
             var mobBadges = '';
-            if (rc.isActing) mobBadges += '<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-bold bg-purple-100 text-purple-700 ml-1">署任</span>';
+            if (rc.isActing && !isActingTagOverridden(rc)) mobBadges += '<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-bold bg-purple-100 text-purple-700 ml-1">署任</span>';
             if (rc.onAttachment) mobBadges += '<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-bold bg-cyan-100 text-cyan-700 ml-1">借調</span>';
             if (rc.isFutureIncoming) mobBadges += '<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-bold bg-indigo-100 text-indigo-700 ml-1">到任</span>';
 
@@ -1901,6 +2081,12 @@ function renderDatabaseTable() {
         var ns = '';
         if (typeof isNoticeSupersededByAdmin === 'function' && r.posting_notice) {
             if (isNoticeSupersededByAdmin(r.posting_notice)) ns = ' superseded-row';
+        }
+        if (!ns && typeof isMovementSupersededByLink === 'function') {
+            var cMovD = _resolveCanonicalMovement(r);
+            if (cMovD && cMovD.movementId && isMovementSupersededByLink(cMovD.movementId)) {
+                ns = ' superseded-row';
+            }
         }
         var tr = document.createElement('tr');
         tr.className = 'hover:bg-slate-50 transition-colors' + ns;
@@ -2028,6 +2214,9 @@ function renderHistoryView() {
     historyTitleEl.innerText = '歷史時間軸 / 人物清單';
 
     var filtered = _getMemoHistoryRows();
+    var derivedStatuses = (historyTarget.type === 'role' || historyTarget.type === 'name')
+        ? _computeDerivedStatuses(filtered, historyTarget.type)
+        : {};
     historyCountEl.innerText = filtered.length + ' 筆紀錄';
     tbody.innerHTML = '';
 
@@ -2035,11 +2224,21 @@ function renderHistoryView() {
         var r = filtered[hi];
         var v = getValidationForRecordByIndex(records.indexOf(r));
         var hns = '';
+        var canonicalMov = null;
         if (typeof isNoticeSupersededByAdmin === 'function' && r.posting_notice) {
             var superByH = isNoticeSupersededByAdmin(r.posting_notice);
             if (superByH) hns = ' superseded-row';
             if (r.cancelledFlag) hns = ' cancelled-row';
         }
+        // Check movement-level supersession for row styling
+        if (!hns && typeof isMovementSupersededByLink === 'function') {
+            canonicalMov = _resolveCanonicalMovement(r);
+            if (canonicalMov && canonicalMov.movementId && isMovementSupersededByLink(canonicalMov.movementId)) {
+                hns = ' superseded-row';
+            }
+        }
+        if (derivedStatuses[hi] === 'valid') hns += ' history-active-row';
+        if (derivedStatuses[hi] === 'future' && !hns) hns += ' history-future-row';
         var tr = document.createElement('tr');
         if (hns) tr.className = hns;
         tr.innerHTML =
@@ -2055,7 +2254,7 @@ function renderHistoryView() {
                     '<span class="text-blue-600 mx-1">(</span><button type="button" class="text-blue-600 font-bold hover:underline" onclick="viewHistory(\'dept\', \'' + escapeJsHtml(r.to_dept) + '\')">' + escapeHtml(r.to_dept || '-') + '</button><span class="text-blue-600 mx-1">)</span>' +
                 '</div>' +
             '</td>' +
-            '<td class="px-6 py-4 text-xs font-mono">' + escapeHtml(r.date || '') + '</td>' +
+            '<td class="px-6 py-4 text-xs font-mono">' + escapeHtml(r.date || '') + _renderDerivedStatusBadge(derivedStatuses[hi] || '') + '</td>' +
             '<td class="px-6 py-4 text-[10px] font-bold text-blue-500 cursor-pointer hover:underline" onclick="viewHistory(\'pn\', \'' + escapeJsHtml(r.posting_notice) + '\')">' + escapeHtml(r.posting_notice || '-') + ' ' + _renderNoticeStatusBadge(r.posting_notice, r) + '</td>' +
             '<td class="px-6 py-4 admin-only">' + renderValidationBadge(v.severity, v.overridden) + (v.issues && v.issues.length > 0 ? '<div class="text-[10px] text-slate-600 mt-1 leading-relaxed space-y-0.5">' + v.issues.map(function(iss) { return '<div>' + escapeHtml(iss.message) + '</div>'; }).join('') + '</div>' : '') + '</td>' +
             '<td class="px-6 py-4 flex gap-3">' +
@@ -2064,6 +2263,60 @@ function renderHistoryView() {
             '</td>';
         tbody.appendChild(tr);
     }
+}
+
+function _renderDerivedStatusBadge(status) {
+    if (!status) return '';
+    var labels = {
+        valid:  { label: 'VALID',  css: 'derived-active' },
+        past:   { label: 'PAST',   css: 'derived-past' },
+        future: { label: 'FUTURE', css: 'derived-future' }
+    };
+    var m = labels[status] || labels.past;
+    return ' <span class="derived-status-badge ' + m.css + '">' + m.label + '</span>';
+}
+
+function _computeDerivedStatuses(filtered, targetType) {
+    var statusMap = {};
+    if (targetType !== 'role' && targetType !== 'name') return statusMap;
+    var todayKey = (function() {
+        var d = new Date();
+        return d.getFullYear() + String(d.getMonth() + 1).padStart(2, '0') + String(d.getDate()).padStart(2, '0');
+    })();
+
+    var bestPastIdx = -1, bestPastDk = '';
+    for (var i = 0; i < filtered.length; i++) {
+        var r = filtered[i];
+        var dk = _cachedDateKey(r.date) || '';
+        if (dk > todayKey) {
+            statusMap[i] = 'future';
+            continue;
+        }
+        if (r.supersededFlag || r.cancelledFlag) continue;
+        if (typeof isNoticeSupersededByAdmin === 'function' && r.posting_notice) {
+            if (isNoticeSupersededByAdmin(r.posting_notice)) continue;
+        }
+        // Check movement-level supersession links
+        if (typeof isMovementSupersededByLink === 'function') {
+            var cMov = _resolveCanonicalMovement(r);
+            if (cMov && cMov.movementId && isMovementSupersededByLink(cMov.movementId)) continue;
+        }
+        if (dk > bestPastDk) {
+            bestPastDk = dk;
+            bestPastIdx = i;
+        }
+    }
+
+    for (var j = 0; j < filtered.length; j++) {
+        if (statusMap[j]) continue;
+        if (j === bestPastIdx) {
+            statusMap[j] = 'valid';
+        } else if (bestPastIdx >= 0) {
+            statusMap[j] = 'past';
+        }
+    }
+
+    return statusMap;
 }
 
 function _getMemoHistoryDeptRows(deptName) {
@@ -2524,8 +2777,32 @@ function linkSupersession() {
 function unlinkSupersession(pnRaw) {
     if (!isAdmin()) return;
     if (typeof unlinkNoticeSupersession !== 'function') return;
-    unlinkNoticeSupersession(pnRaw);
-    showToast('已清除 PN ' + pnRaw + ' 的取代連結', 'info');
+    var result = unlinkNoticeSupersession(pnRaw);
+
+    if (!result || !result.deleted) {
+        showToast('找不到 PN ' + pnRaw + ' 的取代連結', 'warning');
+        _renderSupersessionChain();
+        return;
+    }
+
+    // Also clean up ALL corresponding movement-level links in this notice
+    if (typeof _movementSupersessionLinks === 'object' && typeof MovementStore !== 'undefined') {
+        for (var mi = 0; mi < MovementStore.length; mi++) {
+            var mn = MovementStore[mi];
+            var movPn = NoticeStore[mn.noticeId] ? NoticeStore[mn.noticeId].noticeNumber : '';
+            if (movPn === pnRaw) {
+                if (typeof unlinkMovementSupersession === 'function') {
+                    unlinkMovementSupersession(mn.movementId);
+                }
+                mn.supersededFlag = false;
+            }
+        }
+    }
+
+    // Force immediate notice status recompute
+    if (typeof resolveNoticeStatuses === 'function') resolveNoticeStatuses();
+
+    showToast('已清除 PN ' + pnRaw + ' 的取代連結 (' + result.removedEdges + ' edges)', 'info');
     addLog('Supersession unlinked: ' + pnRaw, 'info');
 
     _markAllDirty();
@@ -2547,54 +2824,265 @@ function _renderSupersessionChain() {
     var container = document.getElementById('supersessionChainContainer');
     if (!container) return;
 
-    if (typeof _supersessionLinks !== 'object' || typeof NoticeStore === 'undefined') {
+    if (!historyTarget || !historyTarget.value) {
         container.innerHTML = '';
         return;
     }
 
-    var links = Object.keys(_supersessionLinks);
-    if (links.length === 0) {
-        container.innerHTML = '<div class="text-[10px] text-slate-400 italic">尚無取代關係</div>';
+    var scope = getSupersessionScopeForHistoryTarget();
+    if (!scope) {
+        container.innerHTML = '';
         return;
     }
 
+    var hasNoticeLinks = (typeof _supersessionLinks === 'object' && Object.keys(_supersessionLinks).length > 0);
+    var hasMovementLinks = (typeof _movementSupersessionLinks === 'object' && Object.keys(_movementSupersessionLinks).length > 0);
+
     var html = '<div class="space-y-2 mt-3">';
     var seen = {};
-    for (var i = 0; i < links.length; i++) {
-        var nid = links[i];
-        if (seen[nid]) continue;
-        var link = _supersessionLinks[nid];
-        if (!link.supersededByNoticeId && !link.supersedesNoticeIds.length) continue;
+    var renderedCount = 0;
 
-        seen[nid] = true;
-        html += '<div class="p-2 bg-white rounded-lg border border-slate-200">';
-        var noticeNumber = (NoticeStore[nid] || {}).noticeNumber || nid;
-        html += '<div class="flex justify-between items-center">';
-        html += '<span class="text-[11px] font-bold text-slate-700">PN ' + escapeHtml(noticeNumber) + '</span>';
+    // Show notice-level links filtered to scope
+    if (hasNoticeLinks && typeof NoticeStore !== 'undefined') {
+        var nlinks = Object.keys(_supersessionLinks);
+        for (var ni = 0; ni < nlinks.length; ni++) {
+            var nid = nlinks[ni];
+            if (seen['n_' + nid]) continue;
+            var nlink = _supersessionLinks[nid];
+            if (!nlink.supersededByNoticeId && !nlink.supersedesNoticeIds.length) continue;
 
-        if (link.supersededByNoticeId) {
-            var superById = link.supersededByNoticeId;
-            var superPnum = (NoticeStore[superById] || {}).noticeNumber || superById;
-            html += '<span class="text-[10px] text-slate-400">← 被 <span class="font-bold text-amber-600">PN ' + escapeHtml(superPnum) + '</span> 取代</span>';
-        }
+            var noticeNumber = (NoticeStore[nid] || {}).noticeNumber || nid;
+            var superById = nlink.supersededByNoticeId;
+            var superPnum = superById ? ((NoticeStore[superById] || {}).noticeNumber || '') : '';
+            var supersedesNids = nlink.supersedesNoticeIds || [];
 
-        if (link.supersedesNoticeIds && link.supersedesNoticeIds.length > 0) {
-            html += '<div class="text-[10px] text-slate-500 mt-1">取代：';
-            for (var j = 0; j < link.supersedesNoticeIds.length; j++) {
-                var snid = link.supersedesNoticeIds[j];
-                seen[snid] = true;
-                var sn = (NoticeStore[snid] || {}).noticeNumber || snid;
-                html += '<span class="font-bold text-indigo-600">PN ' + escapeHtml(sn) + '</span>';
-                if (j < link.supersedesNoticeIds.length - 1) html += ', ';
+            var isRelated = scope.relatedNoticeIds.indexOf(nid) >= 0 ||
+                            scope.relatedNoticeNumbers.indexOf(noticeNumber) >= 0 ||
+                            (superById && (scope.relatedNoticeIds.indexOf(superById) >= 0)) ||
+                            (superPnum && (scope.relatedNoticeNumbers.indexOf(superPnum) >= 0));
+
+            if (!isRelated) {
+                for (var nj = 0; nj < supersedesNids.length; nj++) {
+                    if (scope.relatedNoticeIds.indexOf(supersedesNids[nj]) >= 0) { isRelated = true; break; }
+                    var sNum = (NoticeStore[supersedesNids[nj]] || {}).noticeNumber || '';
+                    if (sNum && scope.relatedNoticeNumbers.indexOf(sNum) >= 0) { isRelated = true; break; }
+                }
             }
+
+            if (!isRelated) continue;
+
+            seen['n_' + nid] = true;
+            renderedCount++;
+            html += '<div class="p-2 bg-white rounded-lg border border-slate-200">';
+            html += '<span class="text-[11px] font-bold text-slate-700">PN ' + escapeHtml(noticeNumber) + '</span>';
+            if (superById) {
+                html += '<span class="text-[10px] text-slate-400 ml-2">← <span class="font-bold text-amber-600">PN ' + escapeHtml(superPnum || superById) + '</span></span>';
+            }
+            if (supersedesNids && supersedesNids.length > 0) {
+                html += '<div class="text-[10px] text-slate-500 mt-1 ml-1">取代：';
+                for (nj = 0; nj < supersedesNids.length; nj++) {
+                    var snid = supersedesNids[nj];
+                    seen['n_' + snid] = true;
+                    var sn = (NoticeStore[snid] || {}).noticeNumber || snid;
+                    html += '<span class="font-bold text-indigo-600">PN ' + escapeHtml(sn) + '</span>';
+                    if (nj < supersedesNids.length - 1) html += ', ';
+                }
+                html += '</div>';
+            }
+            html += '<button onclick="unlinkSupersession(\'' + escapeJsHtml(noticeNumber) + '\')" class="text-[10px] font-bold text-red-500 hover:text-red-700 ml-2">✕</button>';
             html += '</div>';
         }
-
-        html += '<button onclick="unlinkSupersession(\'' + escapeJsHtml(noticeNumber) + '\')" class="text-[10px] font-bold text-red-500 hover:text-red-700 ml-2">✕ 移除</button>';
-        html += '</div></div>';
     }
+
+    // Show movement-level links filtered to scope
+    if (hasMovementLinks && typeof MovementStore !== 'undefined') {
+        var mlinks = Object.keys(_movementSupersessionLinks);
+        var hasRenderableMov = false;
+        for (var mi = 0; mi < mlinks.length; mi++) {
+            var movId = mlinks[mi];
+            if (seen['m_' + movId]) continue;
+            var mlink = _movementSupersessionLinks[movId];
+            if (!mlink.supersededByMovementId) continue;
+
+            var superMovId = mlink.supersededByMovementId;
+            var isRelated = scope.relatedMovementIds.indexOf(movId) >= 0 ||
+                            scope.relatedMovementIds.indexOf(superMovId) >= 0;
+
+            // Also check if either movement's notice is in scope
+            if (!isRelated) {
+                var checkMov = null, checkSuper = null;
+                for (var ix = 0; ix < MovementStore.length; ix++) {
+                    if (MovementStore[ix].movementId === movId) checkMov = MovementStore[ix];
+                    if (MovementStore[ix].movementId === superMovId) checkSuper = MovementStore[ix];
+                }
+                if (checkMov && checkMov.noticeId && scope.relatedNoticeIds.indexOf(checkMov.noticeId) >= 0) isRelated = true;
+                if (checkSuper && checkSuper.noticeId && scope.relatedNoticeIds.indexOf(checkSuper.noticeId) >= 0) isRelated = true;
+            }
+
+            if (!isRelated) continue;
+
+            seen['m_' + movId] = true;
+            if (!hasRenderableMov) {
+                html += '<div class="text-[10px] font-bold text-emerald-600 uppercase mt-3 mb-1">Movement-level</div>';
+                hasRenderableMov = true;
+            }
+            renderedCount++;
+
+            var subMov = null, superMov = null;
+            for (ix = 0; ix < MovementStore.length; ix++) {
+                if (MovementStore[ix].movementId === movId) subMov = MovementStore[ix];
+                if (MovementStore[ix].movementId === superMovId) superMov = MovementStore[ix];
+            }
+
+            var subName = subMov ? ((PersonStore[subMov.personId] || {}).name || '?') : movId;
+            var superName = superMov ? ((PersonStore[superMov.personId] || {}).name || '?') : superMovId;
+            var subPN = subMov ? ((NoticeStore[subMov.noticeId] || {}).noticeNumber || '') : '';
+            var superPN = superMov ? ((NoticeStore[superMov.noticeId] || {}).noticeNumber || '') : '';
+
+            html += '<div class="p-2 bg-white rounded-lg border border-emerald-200">' +
+                '<div class="flex justify-between items-center">' +
+                    '<span class="text-[10px] font-bold text-slate-600">' + escapeHtml(subName) + ' ↻</span>' +
+                    '<span class="text-[9px] text-slate-400">' + escapeHtml(subPN) + '</span>' +
+                '</div>' +
+                '<div class="text-[10px] text-emerald-600 mt-0.5">← 被 <span class="font-bold">' + escapeHtml(superName) + '</span> 取代' +
+                    ' <span class="text-[9px] text-slate-400">' + escapeHtml(superPN) + '</span></div>' +
+                '<button onclick="unlinkMovementSupersessionUI(\'' + escapeJsHtml(movId) + '\')" class="text-[9px] font-bold text-red-500 hover:text-red-700 mt-1">✕ 移除</button>' +
+            '</div>';
+        }
+    }
+
     html += '</div>';
-    container.innerHTML = html;
+
+    if (renderedCount === 0) {
+        container.innerHTML = '<div class="text-[10px] text-slate-400 italic">沒有與此選定對象相關的 supersession 記錄</div>';
+    } else {
+        container.innerHTML = html;
+    }
+}
+
+function getSupersessionScopeForHistoryTarget() {
+    if (!historyTarget || !historyTarget.value) return null;
+
+    var relatedNoticeIds = [];
+    var relatedNoticeNumbers = [];
+    var relatedMovementIds = [];
+    var movements = [];
+
+    if (historyTarget.type === 'name' && typeof findMovementsByPersonName === 'function') {
+        movements = findMovementsByPersonName(historyTarget.value);
+    } else if (historyTarget.type === 'role' && typeof findMovementsByRole === 'function') {
+        movements = findMovementsByRole(historyTarget.value, historyTarget.dept || '');
+    } else if (historyTarget.type === 'pn' && typeof findMovementsByNotice === 'function') {
+        movements = findMovementsByNotice(historyTarget.value);
+    }
+
+    // Also include movements from filtered records if canonical lookups are unavailable
+    if (movements.length === 0) {
+        var filtered = typeof _getMemoHistoryRows === 'function' ? _getMemoHistoryRows() : [];
+        for (var f = 0; f < filtered.length; f++) {
+            var r = filtered[f];
+            var cMov = _resolveCanonicalMovement(r);
+            if (cMov) movements.push(cMov);
+        }
+    }
+
+    var seenNids = {}, seenMovs = {};
+    for (var i = 0; i < movements.length; i++) {
+        var m = movements[i];
+        if (m.movementId && !seenMovs[m.movementId]) {
+            seenMovs[m.movementId] = true;
+            relatedMovementIds.push(m.movementId);
+        }
+        if (m.noticeId && !seenNids[m.noticeId]) {
+            seenNids[m.noticeId] = true;
+            relatedNoticeIds.push(m.noticeId);
+            var notice = NoticeStore[m.noticeId];
+            if (notice && notice.noticeNumber && relatedNoticeNumbers.indexOf(notice.noticeNumber) < 0) {
+                relatedNoticeNumbers.push(notice.noticeNumber);
+            }
+        }
+    }
+
+    return {
+        relatedMovementIds: relatedMovementIds,
+        relatedNoticeIds: relatedNoticeIds,
+        relatedNoticeNumbers: relatedNoticeNumbers
+    };
+}
+
+function linkMovementSupersessionUI() {
+    if (!isAdmin()) return;
+    if (typeof registerMovementSupersession !== 'function') {
+        showToast('Movement-level supersession not available', 'warning');
+        return;
+    }
+    var superInput = document.getElementById('supersedingPnInput');
+    var subInput = document.getElementById('supersededPnInput');
+    if (!superInput || !subInput) return;
+    var superPn = superInput.value.trim();
+    var subPn = subInput.value.trim();
+    if (!superPn || !subPn) { showToast('請填寫兩個 PN', 'warning'); return; }
+    if (!historyTarget || historyTarget.type !== 'name' || !historyTarget.value) {
+        showToast('請先選定一個人物以識別 movement record', 'warning');
+        return;
+    }
+    var supersedingMovs = typeof findMovementsByNotice === 'function' ? findMovementsByNotice(superPn) : [];
+    var supersededMovs = typeof findMovementsByNotice === 'function' ? findMovementsByNotice(subPn) : [];
+    supersedingMovs = supersedingMovs.filter(function(m) { return (PersonStore[m.personId] || {}).name === historyTarget.value; });
+    supersededMovs = supersededMovs.filter(function(m) { return (PersonStore[m.personId] || {}).name === historyTarget.value; });
+    if (supersedingMovs.length === 0 || supersededMovs.length === 0) {
+        showToast('找不到對應的 movement record', 'warning');
+        return;
+    }
+    var linked = 0;
+    for (var si = 0; si < supersededMovs.length; si++) {
+        for (var sj = 0; sj < supersedingMovs.length; sj++) {
+            var result = registerMovementSupersession(supersedingMovs[sj].movementId, supersededMovs[si].movementId, 'admin', 'Manual link by admin');
+            if (result) linked++;
+        }
+    }
+    showToast('已建立 ' + linked + ' 條 movement-level 取代連結', 'success');
+    // Force immediate notice status recompute
+    if (typeof resolveNoticeStatuses === 'function') resolveNoticeStatuses();
+    _markAllDirty();
+    _invalidateAllCaches();
+    if (typeof invalidateOccupancyCache === 'function') invalidateOccupancyCache();
+    _scheduleIdle(function() {
+        if (typeof syncCanonicalStores === 'function') syncCanonicalStores(records);
+        if (typeof revalidateAll === 'function') revalidateAll();
+    });
+    _renderSupersessionChain();
+    if (document.getElementById('dbTableBody')) _scheduleRender('db', renderDatabaseTable);
+    if (document.getElementById('currentTableBody')) _scheduleRender('cur', renderCurrentTable);
+    if (historyTarget && historyTarget.value) renderHistoryView();
+}
+
+function unlinkMovementSupersessionUI(movementId) {
+    if (!isAdmin()) return;
+    if (typeof unlinkMovementSupersession !== 'function') return;
+    unlinkMovementSupersession(movementId);
+
+    // Clear remark-based superseded flag on the movement so it doesn't re-trigger
+    for (var mi = 0; mi < MovementStore.length; mi++) {
+        if (MovementStore[mi].movementId === movementId) {
+            MovementStore[mi].supersededFlag = false;
+            break;
+        }
+    }
+
+    // Force immediate notice status recompute
+    if (typeof resolveNoticeStatuses === 'function') resolveNoticeStatuses();
+    showToast('已移除 movement-level 取代連結', 'info');
+    _markAllDirty();
+    _invalidateAllCaches();
+    if (typeof invalidateOccupancyCache === 'function') invalidateOccupancyCache();
+    _scheduleIdle(function() {
+        if (typeof syncCanonicalStores === 'function') syncCanonicalStores(records);
+        if (typeof revalidateAll === 'function') revalidateAll();
+        if (typeof resolveNoticeStatuses === 'function') resolveNoticeStatuses();
+    });
+    if (document.getElementById('currentTableBody')) _scheduleRender('cur', renderCurrentTable);
+    _renderSupersessionChain();
 }
 
 function unlockPage() {
@@ -2607,6 +3095,12 @@ function unlockPage() {
         ov.classList.add('pointer-events-none');
         ov.style.display = 'none';
         document.body.style.overflow = '';
+        var activeSection = document.getElementById('section-' + _currentTab);
+        if (activeSection && activeSection.classList.contains('hidden')) {
+            activeSection.classList.remove('hidden');
+        }
+        if (_currentTab === 'current') _scheduleRender('cur', renderCurrentTable);
+        if (_currentTab === 'database') _scheduleRender('db', renderDatabaseTable);
     } else {
         document.getElementById('passwordError').classList.remove('hidden');
     }
@@ -2886,13 +3380,11 @@ function _issueQuickSupersede(recIdx) {
     if (!isAdmin() || recIdx < 0 || recIdx >= records.length) return;
     var rec = records[recIdx];
     var pn = rec.posting_notice || '';
-    // Pre-fill the supersession panel inputs
     var superInput = document.getElementById('supersedingPnInput');
     var subInput  = document.getElementById('supersededPnInput');
     if (subInput) subInput.value = pn;
     if (superInput) { superInput.value = ''; superInput.focus(); }
-    showToast('請在上方面板輸入取代的 PN，然後按「鏈接取代關係」', 'info', 5000);
-    // Switch to history tab to show the supersession panel
+    showToast('Movement-level: 在上方輸入取代的 PN (取代 PN 入上面、被取代 PN 入下面)，再到 History 點「鏈接 Movement 取代」', 'info', 6000);
     viewHistory('name', rec.name);
     closeIssuePanel();
     setTimeout(function() { _renderSupersessionChain(); }, 300);
@@ -2903,12 +3395,40 @@ function _issueQuickIgnore(recIdx) {
     var key = String(recIdx);
     _adminOverrides[key] = true;
     try { localStorage.setItem('sys_admin_overrides_pro', JSON.stringify(_adminOverrides)); } catch(e) {}
+    try { _adminOverrides = JSON.parse(localStorage.getItem('sys_admin_overrides_pro') || '{}'); } catch(e) { _adminOverrides = {}; }
     revalidateAll();
     _issueGroupsCache = _groupIssues(_validationCache);
     _renderIssuePanel();
     updateValidationBadge();
     if (_currentTab === 'database') _scheduleRender('db', renderDatabaseTable);
     showToast('已忽略 record #' + (recIdx + 1) + ' 的問題', 'info', 2000);
+}
+
+function _issueQuickUnignore(recIdx) {
+    if (!isAdmin()) return;
+    var key = String(recIdx);
+    delete _adminOverrides[key];
+    try { localStorage.setItem('sys_admin_overrides_pro', JSON.stringify(_adminOverrides)); } catch(e) {}
+    try { _adminOverrides = JSON.parse(localStorage.getItem('sys_admin_overrides_pro') || '{}'); } catch(e) { _adminOverrides = {}; }
+    revalidateAll();
+    _issueGroupsCache = _groupIssues(_validationCache);
+    _renderIssuePanel();
+    updateValidationBadge();
+    if (_currentTab === 'database') _scheduleRender('db', renderDatabaseTable);
+    showToast('已撤銷 record #' + (recIdx + 1) + ' 的忽略', 'info', 2000);
+}
+
+function _issueQuickApprove(recIdx) {
+    if (!isAdmin()) return;
+    var key = String(recIdx);
+    _adminOverrides[key] = true;
+    try { localStorage.setItem('sys_admin_overrides_pro', JSON.stringify(_adminOverrides)); } catch(e) {}
+    try { _adminOverrides = JSON.parse(localStorage.getItem('sys_admin_overrides_pro') || '{}'); } catch(e) { _adminOverrides = {}; }
+    revalidateAll();
+    _issueGroupsCache = _groupIssues(_validationCache);
+    _renderIssuePanel();
+    updateValidationBadge();
+    showToast('已確認 record #' + (recIdx + 1) + ' 的問題', 'success', 2000);
 }
 
 function _issueQuickUnignore(recIdx) {
@@ -2959,6 +3479,7 @@ function _bulkIgnoreWarnings() {
         }
     }
     try { localStorage.setItem('sys_admin_overrides_pro', JSON.stringify(_adminOverrides)); } catch(e) {}
+    try { _adminOverrides = JSON.parse(localStorage.getItem('sys_admin_overrides_pro') || '{}'); } catch(e) { _adminOverrides = {}; }
     revalidateAll();
     _issueGroupsCache = _groupIssues(_validationCache);
     _renderIssuePanel();
@@ -2970,12 +3491,34 @@ function _bulkIgnoreWarnings() {
 function _bulkAutoLinkSupersession() {
     if (!isAdmin()) return;
     if (!_validationCache || !_validationCache.results) return;
-    if (typeof registerNoticeSupersession !== 'function') {
+    if (typeof registerNoticeSupersession !== 'function' && typeof registerMovementSupersession !== 'function') {
         showToast('取代鏈接功能未載入', 'error');
         return;
     }
 
     var linked = 0;
+    var canDoMovement = (typeof registerMovementSupersession === 'function' && typeof MovementStore !== 'undefined');
+    var canDoNotice = (typeof registerNoticeSupersession === 'function');
+
+    function _linkMovements(recSuper, recSub) {
+        if (!canDoMovement) return false;
+        var superMovs = MovementStore.filter(function(m) {
+            var p = PersonStore[m.personId]; return p && p.name === recSuper.name && m.effectiveDate === recSuper.date;
+        });
+        var subMovs = MovementStore.filter(function(m) {
+            var p = PersonStore[m.personId]; return p && p.name === recSub.name && m.effectiveDate === recSub.date;
+        });
+        var done = false;
+        for (var si = 0; si < superMovs.length; si++) {
+            for (var sj = 0; sj < subMovs.length; sj++) {
+                if (registerMovementSupersession(superMovs[si].movementId, subMovs[sj].movementId, 'auto-bulk', 'Auto-linked from validation conflict')) {
+                    done = true;
+                }
+            }
+        }
+        return done;
+    }
+
     // Find C02/C03 conflicts where both records have different PNs and one implies supersession
     // Strategy: for C02 (person same-date multi-post), the movement with the higher PN likely supersedes
     for (var i = 0; i < _validationCache.results.length; i++) {
@@ -3018,11 +3561,11 @@ function _bulkAutoLinkSupersession() {
                 if (matchB) scoreB = parseInt(matchB[2]) * 10000 + parseInt(matchB[1]);
 
                 if (scoreA > scoreB) {
-                    registerNoticeSupersession(recA.posting_notice, recB.posting_notice, 'auto-bulk');
-                    linked++;
+                    if (_linkMovements(recA, recB)) linked++;
+                    else if (canDoNotice) { registerNoticeSupersession(recA.posting_notice, recB.posting_notice, 'auto-bulk'); linked++; }
                 } else if (scoreB > scoreA) {
-                    registerNoticeSupersession(recB.posting_notice, recA.posting_notice, 'auto-bulk');
-                    linked++;
+                    if (_linkMovements(recB, recA)) linked++;
+                    else if (canDoNotice) { registerNoticeSupersession(recB.posting_notice, recA.posting_notice, 'auto-bulk'); linked++; }
                 }
             }
         }
@@ -3043,8 +3586,22 @@ function _bulkAutoLinkSupersession() {
             if (pnMatch) {
                 var refPn = pnMatch[1].replace(/\s+/g, '');
                 if (refPn !== recC.posting_notice.replace(/\s+/g, '')) {
-                    registerNoticeSupersession(recC.posting_notice, refPn, 'auto-bulk');
-                    linked++;
+                    if (canDoMovement && typeof findMovementsByNotice === 'function') {
+                        var superMovs = findMovementsByNotice(recC.posting_notice);
+                        var subMovs = findMovementsByNotice(refPn);
+                        for (var sm = 0; sm < superMovs.length; sm++) {
+                            for (var sb = 0; sb < subMovs.length; sb++) {
+                                if (superMovs[sm].toPostId === subMovs[sb].toPostId &&
+                                    superMovs[sm].toDeptId === subMovs[sb].toDeptId) {
+                                    if (registerMovementSupersession(superMovs[sm].movementId, subMovs[sb].movementId, 'auto-bulk', 'Auto-linked from C04/C07 validation'))
+                                        linked++;
+                                }
+                            }
+                        }
+                    } else if (canDoNotice) {
+                        registerNoticeSupersession(recC.posting_notice, refPn, 'auto-bulk');
+                        linked++;
+                    }
                 }
             }
         }
@@ -3065,6 +3622,89 @@ function _bulkAutoLinkSupersession() {
     if (_currentTab === 'database') _scheduleRender('db', renderDatabaseTable);
     if (_currentTab === 'current') _scheduleRender('cur', renderCurrentTable);
     showToast('自動鏈接了 ' + linked + ' 組取代關係', 'success', 4000);
+}
+
+function _bulkAutoLinkMovementSupersession() {
+    if (!isAdmin()) return;
+    if (typeof registerMovementSupersession !== 'function') {
+        showToast('Movement-level supersession not available', 'warning');
+        return;
+    }
+    if (!_validationCache || !_validationCache.results) return;
+
+    var linked = 0;
+    for (var i = 0; i < _validationCache.results.length; i++) {
+        var r = _validationCache.results[i];
+        if (r.overridden || !r.issues) continue;
+        for (var j = 0; j < r.issues.length; j++) {
+            var iss = r.issues[j];
+            if (iss.ruleId !== 'C02' && iss.ruleId !== 'C03') continue;
+            if (iss.severity === 'ok') continue;
+            var recA = records[r.index];
+            if (!recA || !recA.posting_notice) continue;
+            var dateK = typeof _cachedDateKey === 'function' ? _cachedDateKey(recA.date) : '';
+            var searchName = recA.name;
+
+            for (var k = i + 1; k < _validationCache.results.length; k++) {
+                var r2 = _validationCache.results[k];
+                if (r2.overridden || !r2.issues) continue;
+                var hasConflict = false;
+                for (var m = 0; m < r2.issues.length; m++) {
+                    if (r2.issues[m].ruleId === iss.ruleId) { hasConflict = true; break; }
+                }
+                if (!hasConflict) continue;
+                var recB = records[r2.index];
+                if (!recB || !recB.posting_notice || recB.name !== searchName) continue;
+                if (recA.posting_notice === recB.posting_notice) continue;
+                var dateK2 = typeof _cachedDateKey === 'function' ? _cachedDateKey(recB.date) : '';
+                if (dateK !== dateK2) continue;
+
+                var matchA = String(recA.posting_notice).match(/(\d+)\s*\/\s*(\d{4})/);
+                var matchB = String(recB.posting_notice).match(/(\d+)\s*\/\s*(\d{4})/);
+                var scoreA = matchA ? parseInt(matchA[2]) * 10000 + parseInt(matchA[1]) : 0;
+                var scoreB = matchB ? parseInt(matchB[2]) * 10000 + parseInt(matchB[1]) : 0;
+
+                var recSuper, recSub;
+                if (scoreA > scoreB) { recSuper = recA; recSub = recB; }
+                else if (scoreB > scoreA) { recSuper = recB; recSub = recA; }
+                else continue;
+
+                var superMovs = MovementStore.filter(function(m) {
+                    var p = PersonStore[m.personId]; return p && p.name === recSuper.name && m.effectiveDate === recSuper.date && m.toPostId && m.toDeptId;
+                });
+                var subMovs = MovementStore.filter(function(m) {
+                    var p = PersonStore[m.personId]; return p && p.name === recSub.name && m.effectiveDate === recSub.date && m.toPostId && m.toDeptId;
+                });
+
+                for (var sm = 0; sm < superMovs.length; sm++) {
+                    for (var sb = 0; sb < subMovs.length; sb++) {
+                        if (superMovs[sm].toPostId === subMovs[sb].toPostId &&
+                            superMovs[sm].toDeptId === subMovs[sb].toDeptId) {
+                            if (registerMovementSupersession(superMovs[sm].movementId, subMovs[sb].movementId, 'auto-bulk', 'Auto-linked movement supersession'))
+                                linked++;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    _markAllDirty();
+    _invalidateAllCaches();
+    if (typeof invalidateOccupancyCache === 'function') invalidateOccupancyCache();
+    _scheduleIdle(function() {
+        if (typeof syncCanonicalStores === 'function') syncCanonicalStores(records);
+        if (typeof resolveNoticeStatuses === 'function') resolveNoticeStatuses();
+        if (typeof revalidateAll === 'function') revalidateAll();
+    });
+    revalidateAll();
+    _issueGroupsCache = _groupIssues(_validationCache);
+    _renderIssuePanel();
+    updateValidationBadge();
+    if (_currentTab === 'database') _scheduleRender('db', renderDatabaseTable);
+    if (_currentTab === 'current') _scheduleRender('cur', renderCurrentTable);
+    _renderSupersessionChain();
+    showToast('已建立 ' + linked + ' 條 movement-level 取代連結', 'success', 4000);
 }
 
 function _bulkRevalidate() {
