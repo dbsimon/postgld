@@ -1742,7 +1742,7 @@ async function processPDF() {
 
             let fileAffected = 0;
             result.forEach(newRec => {
-                const normalized = {
+                let normalized = {
                     name: (() => {
                         let n = (newRec.name || '').trim().replace(/\s+/g, ' ');
                         const match = n.match(/\((Miss|Ms|Mr|Mrs|Dr|Madam)\)/i);
