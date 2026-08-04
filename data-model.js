@@ -46,22 +46,30 @@ function extractNoticeNumber(raw) {
   return { number: 0, year: 0, serial: s || '' };
 }
 
-function parseDateToKey(dateStr) {
-  var raw = (dateStr || '').trim();
-  if (!raw) return '';
-  var dm = raw.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})$/);
-  if (dm) return dm[3] + dm[2].padStart(2, '0') + dm[1].padStart(2, '0');
-  var tm = raw.match(/^(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{4})$/);
-  if (tm) {
-    var mm = { jan:'01',feb:'02',mar:'03',apr:'04',may:'05',jun:'06',
-               jul:'07',aug:'08',sep:'09',oct:'10',nov:'11',dec:'12' };
-    return tm[3] + (mm[tm[2].toLowerCase()] || '00') + tm[1].padStart(2, '0');
+
+// ---- canonical date-only helpers (added by true-date patch) -------------
+function normaliseEffectiveDate(value) {
+  if (value instanceof Date && !isNaN(value)) {
+    return value.getFullYear() + '-' + String(value.getMonth() + 1).padStart(2, '0') + '-' + String(value.getDate()).padStart(2, '0');
   }
-  var p = new Date(raw);
-  if (!isNaN(p.getTime())) {
-    return p.getFullYear() + String(p.getMonth() + 1).padStart(2, '0') + String(p.getDate()).padStart(2, '0');
-  }
-  return raw;
+  var s = String(value == null ? '' : value).trim();
+  var iso = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  var dmy = s.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})$/);
+  var key = s.match(/^(\d{4})(\d{2})(\d{2})$/);
+  var y, m, d;
+  if (iso) { y = +iso[1]; m = +iso[2]; d = +iso[3]; }
+  else if (dmy) { d = +dmy[1]; m = +dmy[2]; y = +dmy[3]; }
+  else if (key) { y = +key[1]; m = +key[2]; d = +key[3]; }
+  else throw new Error('Invalid Effective Date: ' + s);
+  var check = new Date(y, m - 1, d);
+  if (check.getFullYear() !== y || check.getMonth() !== m - 1 || check.getDate() !== d) throw new Error('Invalid calendar date: ' + s);
+  return y + '-' + String(m).padStart(2, '0') + '-' + String(d).padStart(2, '0');
+}
+function effectiveDateToKey(value) { return normaliseEffectiveDate(value).replace(/-/g, ''); }
+function formatEffectiveDate(value) { var iso = normaliseEffectiveDate(value).split('-'); return iso[2] + '.' + iso[1] + '.' + iso[0]; }
+
+function parseDateToKey(dateValue) {
+  try { return effectiveDateToKey(dateValue); } catch (e) { return ''; }
 }
 
 // ---- canonical stores ----------------------------------------------------
@@ -502,6 +510,8 @@ function createNotice(pnRaw, sourceFile) {
 }
 
 function createMovement(flatRec, sourceType) {
+  flatRec.dateISO = normaliseEffectiveDate(flatRec.dateISO || flatRec.date);
+  flatRec.date = formatEffectiveDate(flatRec.dateISO);
   sourceType = sourceType || 'manual';
 
   var person     = createPerson(flatRec.name,  { nickname: personNicknames[flatRec.name], notes: personNotes[flatRec.name], image: personImages[flatRec.name] });
@@ -571,6 +581,8 @@ function createMovement(flatRec, sourceType) {
 }
 
 function updateMovementFromFlat(existing, flatRec, sourceType) {
+  flatRec.dateISO = normaliseEffectiveDate(flatRec.dateISO || flatRec.date);
+  flatRec.date = formatEffectiveDate(flatRec.dateISO);
   existing.remark = flatRec.remark || existing.remark;
   var meta = typeof parsePostingRemark === 'function'
     ? parsePostingRemark(flatRec.remark || '')

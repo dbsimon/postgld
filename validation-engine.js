@@ -25,7 +25,7 @@ var VALIDATION_RULES = [
   { id: 'R05', name: 'Required To Dept',    severity: 'error',   desc: 'Destination department (To Dept) must be present.' },
   { id: 'S01', name: 'PN Date Lookalike',   severity: 'error',   desc: 'PN No. appears to be an ISO date string instead of a notice number.' },
   { id: 'S02', name: 'Date Plausibility',   severity: 'warning', desc: 'Effective date is outside plausible range (1997-01-01 to 2100-12-31).' },
-  { id: 'S03', name: 'Date Format',          severity: 'warning', desc: 'Date does not follow DD.MM.YYYY format.' },
+  { id: 'S03', name: 'Date Format',          severity: 'warning', desc: 'Date must be YYYY-MM-DD (legacy D.M.YYYY is accepted during migration).' },
   { id: 'S04', name: 'PN Format',           severity: 'warning', desc: 'PN No. does not follow N/YYYY format.' },
   { id: 'C01', name: 'Duplicate Movement',  severity: 'error',   desc: 'Same person, same to-post, same date, same PN already exists.' },
   { id: 'C02', name: 'Person Same-Date Conflict', severity: 'error', desc: 'Same person has two or more movements on the same effective date.' },
@@ -39,22 +39,9 @@ var VALIDATION_RULES = [
 
 // ---- helper: parse date key (mirrors parseDateToKey in data-model.js) ------
 
-function valParseDateKey(dateStr) {
-  var raw = (dateStr || '').trim();
-  if (!raw) return '';
-  var dm = raw.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})$/);
-  if (dm) return dm[3] + dm[2].padStart(2, '0') + dm[1].padStart(2, '0');
-  var tm = raw.match(/^(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{4})$/);
-  if (tm) {
-    var mm = { jan:'01',feb:'02',mar:'03',apr:'04',may:'05',jun:'06',
-               jul:'07',aug:'08',sep:'09',oct:'10',nov:'11',dec:'12' };
-    return tm[3] + (mm[tm[2].toLowerCase()] || '00') + tm[1].padStart(2, '0');
-  }
-  var p = new Date(raw);
-  if (!isNaN(p.getTime())) {
-    return p.getFullYear() + String(p.getMonth() + 1).padStart(2, '0') + String(p.getDate()).padStart(2, '0');
-  }
-  return raw;
+function valParseDateKey(dateValue) {
+  // true-date patch: accepts YYYY-MM-DD and legacy D.M.YYYY
+  try { return typeof effectiveDateToKey === 'function' ? effectiveDateToKey(dateValue) : ''; } catch (e) { return ''; }
 }
 
 // ---- helper: normalize names / posts for dedup -----------------------------

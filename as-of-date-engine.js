@@ -306,12 +306,12 @@ function getCurrentOccupancy() {
  * Get occupancy for all posts as of a specific date string (DD.MM.YYYY).
  */
 function getOccupancyAtDisplayDate(displayDate) {
+  return getOccupancyAtDate(displayDate);
+}
+
+function getOccupancyAtDate(inputDate) {
   var dk;
-  if (displayDate) {
-    var m = String(displayDate).match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})$/);
-    if (m) dk = m[3] + m[2].padStart(2, '0') + m[1].padStart(2, '0');
-  }
-  dk = dk || formatTodayKey();
+  try { dk = effectiveDateToKey(inputDate); } catch (e) { dk = formatTodayKey(); }
   return getOccupancySnapshot(dk);
 }
 

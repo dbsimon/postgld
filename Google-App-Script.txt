@@ -55,7 +55,7 @@ SCHEMAS.Movements = {
   ],
   widths:    [90,180,140,140,140,140,110,90,130,180,250, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
   hidden:    [12,13,14,15,16,17,18,19,20,21,22,23,24,25,26],
-  textCols:  [7,8]  // G=Effective Date, H=PN No.
+  textCols: [8]  // G=Effective Date, H=PN No.
 };
 
 SCHEMAS.Notices = {
@@ -219,6 +219,9 @@ function ensureSheet(name, schema) {
  * Write data rows to a master sheet.  Clears rows 2+, writes new data, formats.
  */
 function writeSheetWithHeaders(name, schema, rows) {
+  if (name === 'Movements' && rows && rows.length) {
+    rows = rows.map(function(row) { var copy = row.slice(); copy[6] = toSheetEffectiveDate(copy[6]); return copy; });
+  }
   var sheet = ensureSheet(name, schema);
 
   // clear existing data (keep header)
@@ -610,6 +613,17 @@ function hashIdLocal(str) {
 }
 
 // ---- row normalisation ----------------------------------------------------
+
+
+function toSheetEffectiveDate(value) {
+  var iso = normaliseEffectiveDate(value);
+  var p = iso.split('-');
+  return new Date(Number(p[0]), Number(p[1]) - 1, Number(p[2]));
+}
+function sheetDateToIso(value) {
+  if (!(value instanceof Date) || isNaN(value)) return '';
+  return value.getFullYear() + '-' + String(value.getMonth() + 1).padStart(2, '0') + '-' + String(value.getDate()).padStart(2, '0');
+}
 
 function rowVal(row, col) {
   if (row[col] === undefined || row[col] === null) return '';
@@ -1257,6 +1271,9 @@ var COLORS = {
  *   freeze row 1 · hide tech cols · alternating colours · PN/date as text · filter
  */
 function formatMasterSheet(name, schema, rowCount) {
+  if (name === 'Movements' && rowCount > 1) {
+    SpreadsheetApp.getActiveSpreadsheet().getSheetByName(name).getRange(2, 7, rowCount - 1, 1).setNumberFormat('dd.MM.yyyy');
+  }
   if (!rowCount || rowCount < 2) rowCount = 2;
   var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(name);
   if (!sheet) return;
@@ -1533,3 +1550,13 @@ function movementsConditionalRules() {
 }
 
 // ---- conditional formatting rules applied by refresh functions -----------
+
+
+function migrateMovementDatesToRealDates() {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Movements');
+  if (!sheet || sheet.getLastRow() < 2) return;
+  var range = sheet.getRange(2, 7, sheet.getLastRow() - 1, 1);
+  var values = range.getValues();
+  for (var i = 0; i < values.length; i++) if (values[i][0] !== '') values[i][0] = toSheetEffectiveDate(values[i][0]);
+  range.setValues(values).setNumberFormat('dd.MM.yyyy');
+}

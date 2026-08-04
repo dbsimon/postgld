@@ -1,6 +1,19 @@
 pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.worker.min.js';
 
 let records = JSON.parse(localStorage.getItem('sys_posting_records_pro')) || [];
+
+// ---- true-date patch ------------------------------------------------------
+function normaliseLocalRecordDates(list) {
+  return (list || []).map(function(r) {
+    try {
+      r.dateISO = normaliseEffectiveDate(r.dateISO || r.date);
+      r.date = formatEffectiveDate(r.dateISO); // screen display only
+    } catch (e) { r.dateISO = ''; }
+    return r;
+  });
+}
+records = normaliseLocalRecordDates(records);
+
 let sortState = { key: 'date', direction: 'desc' };
 let historyTarget = { type: null, value: null };
 let personNicknames = JSON.parse(localStorage.getItem('sys_person_nicknames_pro')) || {};
@@ -820,6 +833,7 @@ async function saveAllToSheets() {
 }
 
 async function doSaveToSheets() {
+  records = normaliseLocalRecordDates(records);
     const url = document.getElementById('gdriveLink') ? document.getElementById('gdriveLink').value.trim() : '';
     if (!url || !url.includes('script.google.com')) {
         showToast('請先在「設定」面板設定 Apps Script 連結。', 'warning');
@@ -1188,49 +1202,8 @@ function addLog(msg, type = 'default') {
     consoleBox.scrollTop = consoleBox.scrollHeight;
 }
 
-function parseDateKey(dateStr) {
-    const raw = (dateStr || '').trim();
-    if (!raw) return '';
-
-    const dotMatch = raw.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})$/);
-    if (dotMatch) {
-        const day = dotMatch[1].padStart(2, '0');
-        const month = dotMatch[2].padStart(2, '0');
-        const year = dotMatch[3];
-        return `${year}${month}${day}`;
-    }
-
-    const textMatch = raw.match(/^(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{4})$/);
-    if (textMatch) {
-        const monthMap = {
-            jan: '01', january: '01',
-            feb: '02', february: '02',
-            mar: '03', march: '03',
-            apr: '04', april: '04',
-            may: '05',
-            jun: '06', june: '06',
-            jul: '07', july: '07',
-            aug: '08', august: '08',
-            sep: '09', sept: '09', september: '09',
-            oct: '10', october: '10',
-            nov: '11', november: '11',
-            dec: '12', december: '12'
-        };
-        const day = textMatch[1].padStart(2, '0');
-        const month = monthMap[textMatch[2].toLowerCase()] || '00';
-        const year = textMatch[3];
-        return `${year}${month}${day}`;
-    }
-
-    const parsed = new Date(raw);
-    if (!isNaN(parsed.getTime())) {
-        const year = String(parsed.getFullYear());
-        const month = String(parsed.getMonth() + 1).padStart(2, '0');
-        const day = String(parsed.getDate()).padStart(2, '0');
-        return `${year}${month}${day}`;
-    }
-
-    return raw;
+function parseDateKey(dateValue) {
+  try { return effectiveDateToKey(dateValue); } catch (e) { return ''; }
 }
 
 function cleanDirectoryName(name) {
