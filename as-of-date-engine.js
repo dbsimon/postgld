@@ -1,303 +1,504 @@
 // ==========================================================================
-//  Posting Manager — As-Of-Date Occupancy Engine
+// Posting Manager — As-Of-Date Occupancy Engine
 // ==========================================================================
-//  Replays PostingMovements chronologically to determine post occupancy
-//  at any given date. Distinguishes substantive, acting, and future holders.
+// Reconstructs post occupancy at any selected date by replaying active
+// posting movements chronologically.
 //
-//  Tie-breaking: effectiveDate → PN serial → updatedAt
+// Dependencies, loaded before this file:
+//   - data-model-4.js
+//   - MovementStore, PersonStore, PostStore, DeptStore, NoticeStore
+//   - isMovementActiveForOccupancy()
+//   - normalisePersonName(), hashId() where available
 //
-//  Exports:
-//    getOccupancySnapshot(asOfDate)       → { [postKey]: OccupancyEntry }
-//    getPostTimeline(postKey)             → OccupancyEntry[] over time
-//    getPersonAppointments(personName)    → PersonAppointment[]
-//    getFutureEffectiveMovements()        → movements after today
+// Required script order:
+//   remark-parser.js
+//   data-model-4.js
+//   validation-engine-6.js
+//   as-of-date-engine.js
+//   audit-trail.js
+//   app.js
 // ==========================================================================
 
 'use strict';
 
+// ---- cache ----------------------------------------------------------------
+
 var OCCUPANCY_CACHE = {};
-var OCCUPANCY_CACHE_DATE = null;
+var OCCUPANCY_CACHE_DATE = '';
 var MOVEMENTS_SORTED = null;
 
-// ---- tie-breaking sort ----------------------------------------------------
+function invalidateOccupancyCache() {
+  OCCUPANCY_CACHE = {};
+  OCCUPANCY_CACHE_DATE = '';
+  MOVEMENTS_SORTED = null;
+}
+
+// ---- date and sorting helpers ---------------------------------------------
+
+function formatTodayKey() {
+  var date = new Date();
+
+  return String(date.getFullYear()) +
+    String(date.getMonth() + 1).padStart(2, '0') +
+    String(date.getDate()).padStart(2, '0');
+}
+
+function formatDisplayDate(dateKey) {
+  var key = String(dateKey || '');
+
+  if (!/^\d{8}$/.test(key)) {
+    return key;
+  }
+
+  return key.substring(6, 8) + '.' +
+    key.substring(4, 6) + '.' +
+    key.substring(0, 4);
+}
 
 function pnToSortable(raw) {
-  // "4/2026" → 20260004,  empty → 0
-  if (!raw) return 0;
-  var m = String(raw).match(/(\d{1,4})\s*\/\s*(\d{4})/);
-  if (m) return parseInt(m[2], 10) * 10000 + parseInt(m[1], 10);
-  // try to parse as number
-  var n = parseInt(raw, 10);
-  return isNaN(n) ? 0 : n;
+  if (!raw) {
+    return 0;
+  }
+
+  var match = String(raw).match(/(\d{1,4})\s*\/\s*(\d{4})/);
+
+  if (match) {
+    return parseInt(match[2], 10) * 10000 + parseInt(match[1], 10);
+  }
+
+  var numeric = parseInt(raw, 10);
+  return isNaN(numeric) ? 0 : numeric;
 }
 
 function compareMovements(a, b) {
-  // 1. effective date
-  var da = (a.effectiveDateKey || '');
-  var db = (b.effectiveDateKey || '');
-  if (da !== db) return da.localeCompare(db);
+  var dateA = a.effectiveDateKey || '';
+  var dateB = b.effectiveDateKey || '';
 
-  // 2. PN serial  (higher PN breaks ties within same day)
-  var pa = pnToSortable(a.noticeId ? (NoticeStore[a.noticeId] || {}).noticeNumber : '');
-  var pb = pnToSortable(b.noticeId ? (NoticeStore[b.noticeId] || {}).noticeNumber : '');
-  if (pa !== pb) return pa - pb;
+  if (dateA !== dateB) {
+    return dateA.localeCompare(dateB);
+  }
 
-  // 3. updatedAt  (newer wins)
-  var ua = a.updatedAt || a.createdAt || '';
-  var ub = b.updatedAt || b.createdAt || '';
-  if (ua !== ub) return ua > ub ? 1 : -1;
+  var noticeA = a.noticeId && NoticeStore[a.noticeId]
+    ? NoticeStore[a.noticeId].noticeNumber
+    : '';
+
+  var noticeB = b.noticeId && NoticeStore[b.noticeId]
+    ? NoticeStore[b.noticeId].noticeNumber
+    : '';
+
+  var pnA = pnToSortable(noticeA);
+  var pnB = pnToSortable(noticeB);
+
+  if (pnA !== pnB) {
+    return pnA - pnB;
+  }
+
+  var updatedA = a.updatedAt || a.createdAt || '';
+  var updatedB = b.updatedAt || b.createdAt || '';
+
+  if (updatedA !== updatedB) {
+    return updatedA > updatedB ? 1 : -1;
+  }
 
   return 0;
 }
 
-// ---- cache management -----------------------------------------------------
-
-function invalidateOccupancyCache() {
-  OCCUPANCY_CACHE = {};
-  OCCUPANCY_CACHE_DATE = null;
-  MOVEMENTS_SORTED = null;
-}
-
 function getSortedMovements() {
-  if (MOVEMENTS_SORTED) return MOVEMENTS_SORTED;
-  var filtered = MovementStore.filter(function(m) {
+  if (MOVEMENTS_SORTED) {
+    return MOVEMENTS_SORTED;
+  }
+
+  var source = Array.isArray(MovementStore)
+    ? MovementStore
+    : [];
+
+  MOVEMENTS_SORTED = source.filter(function(movement) {
     if (typeof isMovementActiveForOccupancy === 'function') {
-      return isMovementActiveForOccupancy(m);
+      return isMovementActiveForOccupancy(movement);
     }
-    // Fallback: filter at movement level only (no notice-level cascade)
-    if (m.supersededFlag || m.cancelledFlag) return false;
-    return true;
+
+    return !movement.cancelledFlag && !movement.supersededFlag;
   });
-  filtered.sort(compareMovements);
-  MOVEMENTS_SORTED = filtered;
+
+  MOVEMENTS_SORTED.sort(compareMovements);
+
   return MOVEMENTS_SORTED;
 }
 
-// ---- post key helpers -----------------------------------------------------
+// ---- post helpers ----------------------------------------------------------
 
 function postKey(post, dept) {
-  return (post || '').trim() + '||' + (dept || '').trim();
+  return String(post || '').trim() + '||' + String(dept || '').trim();
 }
 
-// ---- core replay engine ---------------------------------------------------
+function getPostPair(movement, direction) {
+  var postId = direction === 'from'
+    ? movement.fromPostId
+    : movement.toPostId;
 
-/**
- * Replay all movements up to `asOfDate` (inclusive) and return occupancy.
- *
- * @param {string} asOfDate  — "YYYYMMDD" sort key (from parseDateToKey)
- * @return {object} { [postKey]: OccupancyEntry }
- */
+  var deptId = direction === 'from'
+    ? movement.fromDeptId
+    : movement.toDeptId;
+
+  var post = PostStore[postId];
+  var dept = DeptStore[deptId];
+
+  if (!post || !dept) {
+    return null;
+  }
+
+  return {
+    key: postKey(post.title, dept.name),
+    postTitle: post.title || '',
+    deptName: dept.name || ''
+  };
+}
+
+function getCurrentOverrideStatus(key, selectedDateKey) {
+  /*
+   * postOverrides contains only present-state instructions and does not
+   * contain an effective date. Therefore it is applied only to today.
+   */
+  if (selectedDateKey !== formatTodayKey()) {
+    return '';
+  }
+
+  if (
+    typeof postOverrides !== 'undefined' &&
+    postOverrides &&
+    postOverrides[key] === 'deleted'
+  ) {
+    return 'deleted';
+  }
+
+  return '';
+}
+
+function ensureEntry(state, key, movement, selectedDateKey) {
+  if (!state[key]) {
+    var parts = key.split('||');
+    var isObsolete = getCurrentOverrideStatus(key, selectedDateKey) === 'deleted';
+
+    state[key] = {
+      postKey: key,
+      postTitle: parts[0] || '',
+      deptName: parts[1] || '',
+      substantiveHolder: null,
+      actingHolder: null,
+      futureIncoming: null,
+      isVacant: !isObsolete,
+      isObsolete: isObsolete,
+      lastMovement: movement || null,
+      heldSince: ''
+    };
+  }
+
+  if (
+    movement &&
+    (
+      !state[key].lastMovement ||
+      compareMovements(movement, state[key].lastMovement) > 0
+    )
+  ) {
+    state[key].lastMovement = movement;
+  }
+
+  return state[key];
+}
+
+function holderFromMovement(movement) {
+  var person = PersonStore[movement.personId];
+
+  return {
+    personId: movement.personId || '',
+    name: person ? person.name || '' : '',
+    nickname: person ? person.nickname || '' : '',
+    image: person ? person.image || '' : '',
+    effectiveDate: movement.effectiveDate || '',
+    effectiveDateKey: movement.effectiveDateKey || '',
+    movementId: movement.movementId || '',
+    onAttachment: false
+  };
+}
+
+function refreshVacancy(entry) {
+  entry.isVacant = !entry.isObsolete &&
+    !entry.substantiveHolder &&
+    !entry.actingHolder;
+}
+
+function removeSubstantiveHolder(entry, personId) {
+  if (
+    entry.substantiveHolder &&
+    entry.substantiveHolder.personId === personId
+  ) {
+    entry.substantiveHolder = null;
+    refreshVacancy(entry);
+  }
+}
+
+function removeActingHolder(entry, personId) {
+  if (
+    entry.actingHolder &&
+    entry.actingHolder.personId === personId
+  ) {
+    entry.actingHolder = null;
+    refreshVacancy(entry);
+  }
+}
+
+function assignSubstantiveHolder(
+  state,
+  substantivePostByPerson,
+  destinationKey,
+  entry,
+  holder,
+  movement
+) {
+  var personId = holder.personId;
+  var previousKey = substantivePostByPerson[personId];
+
+  /*
+   * A person holds only one substantive post. A later substantive posting
+   * automatically vacates their earlier substantive post.
+   */
+  if (
+    previousKey &&
+    previousKey !== destinationKey &&
+    state[previousKey]
+  ) {
+    removeSubstantiveHolder(state[previousKey], personId);
+  }
+
+  entry.substantiveHolder = holder;
+  entry.isVacant = false;
+  entry.heldSince = movement.effectiveDate || '';
+
+  /*
+   * The substantive appointment supersedes the person's acting appointment
+   * only when both appointments are for the same post.
+   */
+  if (
+    entry.actingHolder &&
+    entry.actingHolder.personId === personId
+  ) {
+    entry.actingHolder = null;
+  }
+
+  substantivePostByPerson[personId] = destinationKey;
+}
+
+function assignActingHolder(
+  state,
+  actingPostByPerson,
+  destinationKey,
+  entry,
+  holder,
+  movement,
+  actingType
+) {
+  var personId = holder.personId;
+  var previousKey = actingPostByPerson[personId];
+
+  /*
+   * A person holds one acting appointment at a time. Their substantive
+   * appointment remains untouched.
+   */
+  if (
+    previousKey &&
+    previousKey !== destinationKey &&
+    state[previousKey]
+  ) {
+    removeActingHolder(state[previousKey], personId);
+  }
+
+  holder.actingType = actingType;
+  entry.actingHolder = holder;
+  entry.isVacant = false;
+  entry.heldSince = movement.effectiveDate || '';
+
+  actingPostByPerson[personId] = destinationKey;
+}
+
+// ---- snapshot replay ------------------------------------------------------
+
 function getOccupancySnapshot(asOfDate) {
-  var key = asOfDate || formatTodayKey();
+  var selectedDateKey = String(asOfDate || formatTodayKey());
 
-  if (!/^\d{8}$/.test(key)) {
-    key = formatTodayKey();
+  if (!/^\d{8}$/.test(selectedDateKey)) {
+    selectedDateKey = formatTodayKey();
   }
 
-  if (OCCUPANCYCACHEDATE === key) {
-    return OCCUPANCYCACHE;
+  if (OCCUPANCY_CACHE_DATE === selectedDateKey) {
+    return OCCUPANCY_CACHE;
   }
 
-  var movs = getSortedMovements();
+  var movements = getSortedMovements();
   var state = {};
 
   /*
-   * Each person's current substantive post.
-   * Rule: one person may hold only one substantive post.
-   * When a later movement appoints the same person to another post,
-   * the earlier substantive post becomes vacant.
+   * Tracks each person's currently held substantive and acting appointments.
    */
   var substantivePostByPerson = {};
-
-  /*
-   * Each person's acting post.
-   * Acting is tracked separately because it may coexist with a
-   * substantive appointment.
-   */
   var actingPostByPerson = {};
 
-  for (var i = 0; i < movs.length; i++) {
-    var m = movs[i];
-    var dk = m.effectiveDateKey || '';
+  for (var i = 0; i < movements.length; i++) {
+    var movement = movements[i];
+    var movementDateKey = movement.effectiveDateKey || '';
 
-    // Critical: movements after the selected as-of date do not exist yet.
-    if (!/^\d{8}$/.test(dk) || dk > key) {
+    /*
+     * Future movements do not exist in a historical snapshot.
+     */
+    if (
+      !/^\d{8}$/.test(movementDateKey) ||
+      movementDateKey > selectedDateKey
+    ) {
       continue;
     }
 
-    var person = PersonStore[m.personId];
-    var personName = person ? person.name : '';
+    var fromPair = getPostPair(movement, 'from');
+    var toPair = getPostPair(movement, 'to');
 
-    var fromPost = PostStore[m.fromPostId];
-    var fromDept = DeptStore[m.fromDeptId];
-    var toPost = PostStore[m.toPostId];
-    var toDept = DeptStore[m.toDeptId];
+    var fromKey = fromPair ? fromPair.key : '';
+    var toKey = toPair ? toPair.key : '';
 
-    var fromKey = (fromPost && fromDept)
-      ? postKey(fromPost.title, fromDept.name)
-      : '';
-
-    var toKey = (toPost && toDept)
-      ? postKey(toPost.title, toDept.name)
-      : '';
-
-    var remarkType = String(m.parsedRemarkType || 'general')
-      .toLowerCase();
+    var remarkType = String(
+      movement.parsedRemarkType || 'general'
+    ).toLowerCase();
 
     /*
-     * A movement away from a source post vacates it only when that
-     * person is genuinely recorded as its holder.
+     * The source post is vacated only when the moving person is its
+     * recorded substantive or acting holder.
      */
     if (fromKey) {
-      var fromEntry = ensureEntry(state, fromKey, m);
+      var fromEntry = ensureEntry(
+        state,
+        fromKey,
+        movement,
+        selectedDateKey
+      );
 
-      if (fromEntry.substantiveHolder &&
-          fromEntry.substantiveHolder.personId === m.personId) {
-        fromEntry.substantiveHolder = null;
-        fromEntry.isVacant = !fromEntry.isObsolete;
+      removeSubstantiveHolder(fromEntry, movement.personId);
+      removeActingHolder(fromEntry, movement.personId);
 
-        if (substantivePostByPerson[m.personId] === fromKey) {
-          delete substantivePostByPerson[m.personId];
-        }
+      if (substantivePostByPerson[movement.personId] === fromKey) {
+        delete substantivePostByPerson[movement.personId];
       }
 
-      if (fromEntry.actingHolder &&
-          fromEntry.actingHolder.personId === m.personId) {
-        fromEntry.actingHolder = null;
-
-        if (actingPostByPerson[m.personId] === fromKey) {
-          delete actingPostByPerson[m.personId];
-        }
+      if (actingPostByPerson[movement.personId] === fromKey) {
+        delete actingPostByPerson[movement.personId];
       }
     }
 
     /*
-     * Some movements only end/alter an existing appointment and do
-     * not appoint the person to a new post.
+     * A departure-only movement has no destination appointment.
      */
     if (!toKey) {
       continue;
     }
 
-    var entry = ensureEntry(state, toKey, m);
-    var holder = holderFromMovement(m);
+    var entry = ensureEntry(
+      state,
+      toKey,
+      movement,
+      selectedDateKey
+    );
 
-    // These change post metadata only; they do not assign a holder.
-    if (remarkType === 'retitled' || remarkType === 'redeployed') {
+    var holder = holderFromMovement(movement);
+
+    /*
+     * Retitling and redeployment establish post metadata but do not assign
+     * the named person as a holder.
+     */
+    if (
+      remarkType === 'retitled' ||
+      remarkType === 'redeployed'
+    ) {
       continue;
     }
 
     /*
-     * End of acting: remove this person only from the acting holder
-     * of the target post. Their substantive appointment remains.
+     * Ending acting removes only the acting assignment. A substantive
+     * appointment at the same post remains in place.
      */
     if (remarkType === 'cease-acting') {
-      if (entry.actingHolder &&
-          entry.actingHolder.personId === m.personId) {
-        entry.actingHolder = null;
+      removeActingHolder(entry, movement.personId);
 
-        if (actingPostByPerson[m.personId] === toKey) {
-          delete actingPostByPerson[m.personId];
-        }
+      if (actingPostByPerson[movement.personId] === toKey) {
+        delete actingPostByPerson[movement.personId];
       }
-
-      entry.isVacant = !entry.isObsolete &&
-        !entry.substantiveHolder &&
-        !entry.actingHolder;
 
       continue;
     }
 
     /*
-     * Transfer-out / no-pay leave removes the person from the target
-     * post if it is their current post. It does not appoint them here.
+     * These movement types end a holding but do not appoint the colleague
+     * to the stated destination.
      */
-    if (remarkType === 'transfer-out' || remarkType === 'no-pay-leave') {
-      if (entry.substantiveHolder &&
-          entry.substantiveHolder.personId === m.personId) {
-        entry.substantiveHolder = null;
+    if (
+      remarkType === 'transfer-out' ||
+      remarkType === 'no-pay-leave'
+    ) {
+      removeSubstantiveHolder(entry, movement.personId);
+      removeActingHolder(entry, movement.personId);
 
-        if (substantivePostByPerson[m.personId] === toKey) {
-          delete substantivePostByPerson[m.personId];
-        }
+      if (substantivePostByPerson[movement.personId] === toKey) {
+        delete substantivePostByPerson[movement.personId];
       }
 
-      if (entry.actingHolder &&
-          entry.actingHolder.personId === m.personId) {
-        entry.actingHolder = null;
-
-        if (actingPostByPerson[m.personId] === toKey) {
-          delete actingPostByPerson[m.personId];
-        }
+      if (actingPostByPerson[movement.personId] === toKey) {
+        delete actingPostByPerson[movement.personId];
       }
-
-      entry.isVacant = !entry.isObsolete &&
-        !entry.substantiveHolder &&
-        !entry.actingHolder;
 
       continue;
     }
 
     /*
-     * Acting assignments do not displace a substantive post.
-     * A person can have one substantive post and one acting post.
+     * Acting/temporary appointments are operational holders but do not
+     * replace the person's substantive appointment.
      */
-    if (remarkType === 'acting' ||
-        remarkType === 'continue-acting' ||
-        remarkType === 'fill-temporary-post') {
-
-      var priorActingKey = actingPostByPerson[m.personId];
-
-      if (priorActingKey && priorActingKey !== toKey && state[priorActingKey]) {
-        var priorActingEntry = state[priorActingKey];
-
-        if (priorActingEntry.actingHolder &&
-            priorActingEntry.actingHolder.personId === m.personId) {
-          priorActingEntry.actingHolder = null;
-          priorActingEntry.isVacant = !priorActingEntry.isObsolete &&
-            !priorActingEntry.substantiveHolder;
-        }
-      }
-
-      entry.actingHolder = holder;
-      entry.actingHolder.actingType =
+    if (
+      remarkType === 'acting' ||
+      remarkType === 'continue-acting' ||
+      remarkType === 'fill-temporary-post'
+    ) {
+      assignActingHolder(
+        state,
+        actingPostByPerson,
+        toKey,
+        entry,
+        holder,
+        movement,
         remarkType === 'fill-temporary-post'
           ? 'temporary'
-          : remarkType;
-
-      actingPostByPerson[m.personId] = toKey;
-
-      /*
-       * If there is no substantive holder, show the acting holder as
-       * the operational holder of the vacant post.
-       */
-      entry.isVacant = !entry.isObsolete && !entry.substantiveHolder;
-      entry.heldSince = m.effectiveDate;
+          : remarkType
+      );
 
       continue;
     }
 
     /*
-     * Attachment keeps the person as substantive holder while marking
-     * the appointment as attached. It must still obey one-post rule.
+     * Attachment retains the substantive appointment and adds a display
+     * marker for the existing current-table UI.
      */
     if (remarkType === 'attachment') {
+      holder.onAttachment = true;
+
       assignSubstantiveHolder(
         state,
         substantivePostByPerson,
         toKey,
         entry,
         holder,
-        m
+        movement
       );
 
-      entry.substantiveHolder.onAttachment = true;
       continue;
     }
 
     /*
-     * Standard appointment, promotion, transfer, fill-vacant-post,
-     * and fill-new-post. Latest eligible movement prevails.
+     * General posting, promotion, transfer, fill-new-post and
+     * fill-vacant-post become substantive appointments.
      */
     assignSubstantiveHolder(
       state,
@@ -305,341 +506,236 @@ function getOccupancySnapshot(asOfDate) {
       toKey,
       entry,
       holder,
-      m
+      movement
     );
   }
 
   /*
-   * Include posts that exist only in postOverrides.
-   * This ensures an obsoleted post appears even where there is no
-   * movement on/before the chosen date.
+   * Include every post that was known on or before the selected date.
+   * This includes vacant historical posts but excludes posts that first
+   * occur only in future movements.
    */
-  for (var overrideKey in postOverrides) {
-    if (!postOverrides.hasOwnProperty(overrideKey)) {
+  for (var j = 0; j < movements.length; j++) {
+    var knownMovement = movements[j];
+    var knownDateKey = knownMovement.effectiveDateKey || '';
+
+    if (
+      !/^\d{8}$/.test(knownDateKey) ||
+      knownDateKey > selectedDateKey
+    ) {
       continue;
     }
 
-    if (!state[overrideKey]) {
-      var parts = overrideKey.split('||');
+    var pairs = [
+      getPostPair(knownMovement, 'from'),
+      getPostPair(knownMovement, 'to')
+    ];
 
-      state[overrideKey] = {
-        postKey: overrideKey,
-        postTitle: parts[0] || '',
-        deptName: parts[1] || '',
-        substantiveHolder: null,
-        actingHolder: null,
-        futureIncoming: null,
-        isVacant: postOverrides[overrideKey] !== 'deleted',
-        isObsolete: postOverrides[overrideKey] === 'deleted',
-        lastMovement: null,
-        heldSince: ''
-      };
+    for (var p = 0; p < pairs.length; p++) {
+      if (!pairs[p]) {
+        continue;
+      }
+
+      ensureEntry(
+        state,
+        pairs[p].key,
+        null,
+        selectedDateKey
+      );
     }
   }
 
-  OCCUPANCYCACHE = state;
-  OCCUPANCYCACHEDATE = key;
+  /*
+   * Legacy overrides have no historical date, so apply them only in the
+   * present-day view. They deliberately do not alter past snapshots.
+   */
+  if (
+    selectedDateKey === formatTodayKey() &&
+    typeof postOverrides !== 'undefined' &&
+    postOverrides
+  ) {
+    for (var overrideKey in postOverrides) {
+      if (
+        !Object.prototype.hasOwnProperty.call(
+          postOverrides,
+          overrideKey
+        )
+      ) {
+        continue;
+      }
+
+      if (!state[overrideKey]) {
+        ensureEntry(
+          state,
+          overrideKey,
+          null,
+          selectedDateKey
+        );
+      }
+
+      if (postOverrides[overrideKey] === 'deleted') {
+        state[overrideKey].isObsolete = true;
+        state[overrideKey].isVacant = false;
+        state[overrideKey].substantiveHolder = null;
+        state[overrideKey].actingHolder = null;
+      } else {
+        state[overrideKey].isObsolete = false;
+        refreshVacancy(state[overrideKey]);
+      }
+    }
+  }
+
+  OCCUPANCY_CACHE = state;
+  OCCUPANCY_CACHE_DATE = selectedDateKey;
 
   return state;
 }
-function assignSubstantiveHolder(
-  state,
-  substantivePostByPerson,
-  newPostKey,
-  newEntry,
-  holder,
-  movement
-) {
-  var personId = holder.personId;
-  var oldPostKey = substantivePostByPerson[personId];
 
-  /*
-   * One colleague, one substantive post:
-   * remove the same person from any earlier substantive post before
-   * assigning the newer post.
-   */
-  if (oldPostKey && oldPostKey !== newPostKey && state[oldPostKey]) {
-    var oldEntry = state[oldPostKey];
+// ---- public query functions ----------------------------------------------
 
-    if (oldEntry.substantiveHolder &&
-        oldEntry.substantiveHolder.personId === personId) {
-      oldEntry.substantiveHolder = null;
-      oldEntry.isVacant = !oldEntry.isObsolete &&
-        !oldEntry.actingHolder;
-    }
-  }
-
-  newEntry.substantiveHolder = holder;
-  newEntry.isVacant = false;
-  newEntry.heldSince = movement.effectiveDate;
-
-  /*
-   * A substantive appointment replaces an acting appointment by the
-   * same person at that particular post.
-   */
-  if (newEntry.actingHolder &&
-      newEntry.actingHolder.personId === personId) {
-    newEntry.actingHolder = null;
-  }
-
-  substantivePostByPerson[personId] = newPostKey;
-}
-
-function ensureEntry(state, key, mov) {
-  if (!state[key]) {
-    var postParts = key.split('||');
-    var isObs = (postOverrides && postOverrides[key] === 'deleted');
-    state[key] = {
-      postKey:           key,
-      postTitle:         postParts[0],
-      deptName:          postParts[1] || '',
-      substantiveHolder: null,
-      actingHolder:      null,
-      futureIncoming:    null,
-      isVacant:          !isObs,
-      isObsolete:        isObs,
-      lastMovement:      mov,
-      heldSince:         mov.effectiveDate || ''
-    };
-  }
-  if (!state[key].lastMovement || compareMovements(mov, state[key].lastMovement) > 0) {
-    state[key].lastMovement = mov;
-  }
-  return state[key];
-}
-
-function holderFromMovement(m) {
-  var p = PersonStore[m.personId];
-  return {
-    personId:       m.personId,
-    name:           p ? p.name : '',
-    nickname:       p ? p.nickname : '',
-    image:          p ? p.image : '',
-    effectiveDate:  m.effectiveDate,
-    effectiveDateKey: m.effectiveDateKey,
-    movementId:     m.movementId
-  };
-}
-
-function applyMovementToEntry(entry, m, dk) {
-  var remarkType = m.parsedRemarkType || 'general';
-  var holder = holderFromMovement(m);
-
-  // ---- acting / continue-acting ------------------------------------------
-  if (remarkType === 'acting' || remarkType === 'continue-acting') {
-    // Set as acting holder; does not replace substantive
-    if (!entry.actingHolder ||
-        dk >= (entry.actingHolder.effectiveDateKey || '')) {
-      entry.actingHolder = holder;
-      entry.actingHolder.actingType = remarkType === 'continue-acting' ? 'continue-acting' : 'acting';
-    }
-    // If there was no substantive holder, this is also the de-facto holder
-    if (!entry.substantiveHolder) {
-      entry.substantiveHolder = holder;
-      entry.heldSince = m.effectiveDate;
-    }
-    entry.isVacant = false;
-    return;
-  }
-
-  // ---- cease-acting ------------------------------------------------------
-  if (remarkType === 'cease-acting') {
-    if (entry.actingHolder && entry.actingHolder.personId === m.personId) {
-      entry.actingHolder = null;
-    }
-    // Check if substantive holder still exists
-    if (!entry.substantiveHolder && !entry.actingHolder) {
-      entry.isVacant = true;
-    }
-    return;
-  }
-
-  // ---- fill-new-post / fill-vacant-post / fill-temporary-post ------------
-  if (remarkType === 'fill-new-post' || remarkType === 'fill-vacant-post' ||
-      remarkType === 'fill-temporary-post') {
-    // New appointment — becomes substantive (or acting for temporary)
-    if (remarkType === 'fill-temporary-post') {
-      entry.actingHolder = holder;
-      entry.actingHolder.actingType = 'temporary';
-    }
-    // Set as substantive holder (later date wins)
-    if (!entry.substantiveHolder ||
-        dk >= (entry.substantiveHolder.effectiveDateKey || '')) {
-      entry.substantiveHolder = holder;
-      entry.heldSince = m.effectiveDate;
-    }
-    entry.isVacant = false;
-    return;
-  }
-
-  // ---- retitled / redeployed — post metadata change, holder unchanged ----
-  if (remarkType === 'retitled' || remarkType === 'redeployed') {
-    // These are post-level changes; holder status is unchanged.
-    // The movement is recorded but doesn't affect occupancy.
-    return;
-  }
-
-  // ---- transfer-out / no-pay-leave / attachment — departure --------------
-  if (remarkType === 'transfer-out' || remarkType === 'no-pay-leave') {
-    // Person leaves; clear their holding
-    if (entry.substantiveHolder && entry.substantiveHolder.personId === m.personId) {
-      entry.substantiveHolder = null;
-    }
-    if (entry.actingHolder && entry.actingHolder.personId === m.personId) {
-      entry.actingHolder = null;
-    }
-    if (!entry.substantiveHolder && !entry.actingHolder) {
-      entry.isVacant = true;
-    }
-    return;
-  }
-
-  // ---- attachment: person is temporarily away but post not vacant --------
-  if (remarkType === 'attachment') {
-    // The person is still the holder but flagged as on attachment
-    if (!entry.substantiveHolder ||
-        dk >= (entry.substantiveHolder.effectiveDateKey || '')) {
-      entry.substantiveHolder = holder;
-      entry.substantiveHolder.onAttachment = true;
-    }
-    entry.isVacant = false;
-    return;
-  }
-
-  // ---- general / default: standard transfer/promotion --------------------
-  // Person joins to_post, leaves from_post (LEAVE is handled above)
-  if (dk > (entry.substantiveHolder ? (entry.substantiveHolder.effectiveDateKey || '') : '')) {
-    entry.substantiveHolder = holder;
-    entry.heldSince = m.effectiveDate;
-  }
-  // If acting holder is the same person, clear acting (they're now substantive)
-  if (entry.actingHolder && entry.actingHolder.personId === m.personId) {
-    entry.actingHolder = null;
-  }
-  entry.isVacant = false;
-}
-
-// ---- date helpers ---------------------------------------------------------
-
-function formatTodayKey() {
-  var d = new Date();
-  return d.getFullYear() +
-    String(d.getMonth() + 1).padStart(2, '0') +
-    String(d.getDate()).padStart(2, '0');
-}
-
-function formatDisplayDate(dateKey) {
-  if (!dateKey || dateKey.length !== 8) return dateKey || '';
-  return dateKey.substring(6, 8) + '.' + dateKey.substring(4, 6) + '.' + dateKey.substring(0, 4);
-}
-
-// ---- query API ------------------------------------------------------------
-
-/**
- * Get occupancy for all posts as of today.
- */
 function getCurrentOccupancy() {
   return getOccupancySnapshot(formatTodayKey());
 }
 
-/**
- * Get occupancy for all posts as of a specific date string (DD.MM.YYYY).
- */
+function getOccupancyAtDate(inputDate) {
+  var dateKey = formatTodayKey();
+
+  if (typeof effectiveDateToKey === 'function') {
+    try {
+      dateKey = effectiveDateToKey(inputDate);
+    } catch (error) {
+      dateKey = formatTodayKey();
+    }
+  } else if (typeof parseDateToKey === 'function') {
+    dateKey = parseDateToKey(inputDate) || formatTodayKey();
+  }
+
+  return getOccupancySnapshot(dateKey);
+}
+
 function getOccupancyAtDisplayDate(displayDate) {
   return getOccupancyAtDate(displayDate);
 }
 
-function getOccupancyAtDate(inputDate) {
-  var dk;
-  try { dk = effectiveDateToKey(inputDate); } catch (e) { dk = formatTodayKey(); }
-  return getOccupancySnapshot(dk);
-}
-
-/**
- * Get the full timeline for a post — all occupancy changes over time.
- */
-function getPostTimeline(postKey) {
-  var movs = getSortedMovements();
-  var timeline = [];
-  for (var i = 0; i < movs.length; i++) {
-    var m = movs[i];
-    var fromKey = postKey(
-      (PostStore[m.fromPostId] || {}).title || '',
-      (DeptStore[m.fromDeptId] || {}).name   || ''
-    );
-    var toKey = postKey(
-      (PostStore[m.toPostId] || {}).title || '',
-      (DeptStore[m.toDeptId] || {}).name   || ''
-    );
-    if (fromKey === postKey || toKey === postKey) {
-      timeline.push({
-        date:          m.effectiveDate,
-        dateKey:       m.effectiveDateKey,
-        person:        PersonStore[m.personId],
-        fromPost:      fromKey === postKey ? (PostStore[m.fromPostId] || {}).title : null,
-        toPost:        toKey === postKey ? (PostStore[m.toPostId] || {}).title : null,
-        remarkType:    m.parsedRemarkType,
-        movement:      m
-      });
-    }
-  }
-  timeline.sort(function(a, b) { return (a.dateKey || '').localeCompare(b.dateKey || ''); });
-  return timeline;
-}
-
-/**
- * Get all appointments for a person (chronological).
- */
-function getPersonAppointments(personName) {
-  var norm = normalisePersonName(personName).toLowerCase();
-  var pid = hashId(norm);
-  var movs = getSortedMovements();
-  var results = [];
-  for (var i = 0; i < movs.length; i++) {
-    var m = movs[i];
-    if (m.personId === pid) {
-      results.push({
-        date:         m.effectiveDate,
-        dateKey:      m.effectiveDateKey,
-        fromPost:     PostStore[m.fromPostId] ? PostStore[m.fromPostId].title : '',
-        fromDept:     DeptStore[m.fromDeptId] ? DeptStore[m.fromDeptId].name   : '',
-        toPost:       PostStore[m.toPostId]   ? PostStore[m.toPostId].title   : '',
-        toDept:       DeptStore[m.toDeptId]   ? DeptStore[m.toDeptId].name    : '',
-        remarkType:   m.parsedRemarkType,
-        noticeNumber: NoticeStore[m.noticeId] ? NoticeStore[m.noticeId].noticeNumber : '',
-        movement:     m
-      });
-    }
-  }
-  return results;
-}
-
-/**
- * Get movements that will take effect after today (future postings).
- */
 function getFutureEffectiveMovements() {
-  var today = formatTodayKey();
-  var movs = getSortedMovements();
-  return movs.filter(function(m) {
-    return (m.effectiveDateKey || '') > today;
+  var todayKey = formatTodayKey();
+
+  return getSortedMovements().filter(function(movement) {
+    return (movement.effectiveDateKey || '') > todayKey;
   });
 }
 
-/**
- * Get occupancy summary counts.
- */
-function getOccupancySummary(asOfDate) {
-  var snapshot = getOccupancySnapshot(asOfDate || formatTodayKey());
-  var keys = Object.keys(snapshot);
-  var occupied = 0, vacant = 0, obsolete = 0, acting = 0, futureIncoming = 0;
-  for (var i = 0; i < keys.length; i++) {
-    var e = snapshot[keys[i]];
-    if (e.isObsolete) obsolete++;
-    else if (e.isVacant) vacant++;
-    else occupied++;
-    if (e.actingHolder) acting++;
-    if (e.futureIncoming) futureIncoming++;
+function getPostTimeline(targetPostKey) {
+  var movements = getSortedMovements();
+  var timeline = [];
+
+  for (var i = 0; i < movements.length; i++) {
+    var movement = movements[i];
+    var fromPair = getPostPair(movement, 'from');
+    var toPair = getPostPair(movement, 'to');
+
+    var isSource = fromPair && fromPair.key === targetPostKey;
+    var isDestination = toPair && toPair.key === targetPostKey;
+
+    if (!isSource && !isDestination) {
+      continue;
+    }
+
+    timeline.push({
+      date: movement.effectiveDate || '',
+      dateKey: movement.effectiveDateKey || '',
+      person: PersonStore[movement.personId] || null,
+      fromPost: isSource ? fromPair.postTitle : null,
+      fromDept: isSource ? fromPair.deptName : null,
+      toPost: isDestination ? toPair.postTitle : null,
+      toDept: isDestination ? toPair.deptName : null,
+      remarkType: movement.parsedRemarkType || '',
+      movement: movement
+    });
   }
+
+  timeline.sort(function(a, b) {
+    return (a.dateKey || '').localeCompare(b.dateKey || '');
+  });
+
+  return timeline;
+}
+
+function getPersonAppointments(personName) {
+  var normalisedName = typeof normalisePersonName === 'function'
+    ? normalisePersonName(personName).toLowerCase()
+    : String(personName || '').trim().toLowerCase();
+
+  var personId = typeof hashId === 'function'
+    ? hashId(normalisedName)
+    : '';
+
+  var movements = getSortedMovements();
+  var appointments = [];
+
+  for (var i = 0; i < movements.length; i++) {
+    var movement = movements[i];
+
+    if (movement.personId !== personId) {
+      continue;
+    }
+
+    var fromPair = getPostPair(movement, 'from');
+    var toPair = getPostPair(movement, 'to');
+
+    appointments.push({
+      date: movement.effectiveDate || '',
+      dateKey: movement.effectiveDateKey || '',
+      fromPost: fromPair ? fromPair.postTitle : '',
+      fromDept: fromPair ? fromPair.deptName : '',
+      toPost: toPair ? toPair.postTitle : '',
+      toDept: toPair ? toPair.deptName : '',
+      remarkType: movement.parsedRemarkType || '',
+      noticeNumber: NoticeStore[movement.noticeId]
+        ? NoticeStore[movement.noticeId].noticeNumber
+        : '',
+      movement: movement
+    });
+  }
+
+  appointments.sort(function(a, b) {
+    return (a.dateKey || '').localeCompare(b.dateKey || '');
+  });
+
+  return appointments;
+}
+
+function getOccupancySummary(asOfDate) {
+  var selectedDateKey = asOfDate || formatTodayKey();
+  var snapshot = getOccupancySnapshot(selectedDateKey);
+  var keys = Object.keys(snapshot);
+
+  var occupied = 0;
+  var vacant = 0;
+  var obsolete = 0;
+  var acting = 0;
+  var futureIncoming = 0;
+
+  for (var i = 0; i < keys.length; i++) {
+    var entry = snapshot[keys[i]];
+
+    if (entry.isObsolete) {
+      obsolete++;
+    } else if (entry.isVacant) {
+      vacant++;
+    } else {
+      occupied++;
+    }
+
+    if (entry.actingHolder) {
+      acting++;
+    }
+
+    if (entry.futureIncoming) {
+      futureIncoming++;
+    }
+  }
+
   return {
     total: keys.length,
     occupied: occupied,
@@ -647,90 +743,109 @@ function getOccupancySummary(asOfDate) {
     obsolete: obsolete,
     acting: acting,
     futureIncoming: futureIncoming,
-    asOfDate: asOfDate || formatTodayKey()
+    asOfDate: selectedDateKey
   };
 }
 
-/**
- * Convert occupancy snapshot to rows for rendering (compatible with
- * the existing renderCurrentTable data format).
- */
+// ---- adapter for renderCurrentTable() ------------------------------------
+
 function occupancyToRows(snapshot, sortKey, sortDir) {
   sortKey = sortKey || 'date';
   sortDir = sortDir || 'desc';
 
-  var keys = Object.keys(snapshot);
+  var keys = Object.keys(snapshot || {});
   var rows = [];
 
   for (var i = 0; i < keys.length; i++) {
-    var e = snapshot[keys[i]];
-    if (!e || e.postKey === '||') continue;
+    var entry = snapshot[keys[i]];
 
-    var holder = e.substantiveHolder || e.actingHolder;
-    var notice = e.lastMovement && NoticeStore[e.lastMovement.noticeId]
-      ? NoticeStore[e.lastMovement.noticeId].noticeNumber
+    if (!entry || entry.postKey === '||') {
+      continue;
+    }
+
+    var holder = entry.substantiveHolder || entry.actingHolder;
+
+    var notice = entry.lastMovement &&
+      NoticeStore[entry.lastMovement.noticeId]
+      ? NoticeStore[entry.lastMovement.noticeId].noticeNumber
       : '';
 
     rows.push({
-      postKey: e.postKey,
+      postKey: entry.postKey,
+
       name: holder ? holder.name : '',
       personId: holder ? holder.personId : '',
 
-      // These names must match app.js exactly.
-      topost: e.postTitle || '',
-      todept: e.deptName || '',
-      date: e.heldSince || '',
-      dateKey: holder ? holder.effectiveDateKey : '',
+      /*
+       * Required compatibility fields:
+       * - app.js legacy/current renderer: to_post, to_dept, posting_notice
+       * - earlier occupancy renderer: topost, todept, postingnotice
+       */
+      to_post: entry.postTitle || '',
+      to_dept: entry.deptName || '',
+      topost: entry.postTitle || '',
+      todept: entry.deptName || '',
+
+      date: entry.heldSince || '',
+      dateKey: holder ? (holder.effectiveDateKey || '') : '',
+
+      posting_notice: notice,
       postingnotice: notice,
 
-      isVacant: !!e.isVacant && !e.isObsolete,
-      isDeleted: !!e.isObsolete,
-      isActing: !!e.actingHolder,
-      isFutureIncoming: !!e.futureIncoming,
+      isVacant: !!entry.isVacant && !entry.isObsolete,
+      isDeleted: !!entry.isObsolete,
+      isActing: !!entry.actingHolder,
+      isFutureIncoming: !!entry.futureIncoming,
       onAttachment: holder ? !!holder.onAttachment : false,
 
-      substantiveHolder: e.substantiveHolder,
-      actingHolder: e.actingHolder,
-      futureIncoming: e.futureIncoming,
+      substantiveHolder: entry.substantiveHolder,
+      actingHolder: entry.actingHolder,
+      futureIncoming: entry.futureIncoming,
 
       rawRecord: {
         name: holder ? holder.name : '',
-        postingnotice: notice,
-        topost: e.postTitle || '',
-        todept: e.deptName || '',
-        date: e.heldSince || ''
+
+        to_post: entry.postTitle || '',
+        to_dept: entry.deptName || '',
+        topost: entry.postTitle || '',
+        todept: entry.deptName || '',
+
+        date: entry.heldSince || '',
+
+        posting_notice: notice,
+        postingnotice: notice
       }
     });
   }
 
   rows.sort(function(a, b) {
-    var va, vb;
+    var valueA;
+    var valueB;
 
     if (sortKey === 'name') {
-      va = a.name || '';
-      vb = b.name || '';
-      return sortDir === 'asc'
-        ? va.localeCompare(vb, 'en')
-        : vb.localeCompare(va, 'en');
-    }
+      valueA = a.name || '';
+      valueB = b.name || '';
 
-    if (sortKey === 'date') {
-      va = a.dateKey || '';
-      vb = b.dateKey || '';
       return sortDir === 'asc'
-        ? va.localeCompare(vb)
-        : vb.localeCompare(va);
+        ? valueA.localeCompare(valueB, 'en')
+        : valueB.localeCompare(valueA, 'en');
     }
 
     if (sortKey === 'role') {
-      va = a.topost || '';
-      vb = b.topost || '';
+      valueA = a.to_post || a.topost || '';
+      valueB = b.to_post || b.topost || '';
+
       return sortDir === 'asc'
-        ? va.localeCompare(vb)
-        : vb.localeCompare(va);
+        ? valueA.localeCompare(valueB, 'en')
+        : valueB.localeCompare(valueA, 'en');
     }
 
-    return 0;
+    valueA = a.dateKey || '';
+    valueB = b.dateKey || '';
+
+    return sortDir === 'asc'
+      ? valueA.localeCompare(valueB)
+      : valueB.localeCompare(valueA);
   });
 
   return rows;
