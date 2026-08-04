@@ -307,25 +307,60 @@ function refreshFutureMovements() {
   var mov = readSheetData('Movements');
   var today = todayKey();
   var rows = [];
+
   for (var i = 0; i < mov.length; i++) {
     var m = mov[i];
-    var dk = m.dateKey || '';
-    if (!dk || dk <= today) continue;
+    var dk = m.dateKey;
+
+    // Ignore missing or invalid dates rather than treating them as future.
+    if (!/^\d{8}$/.test(dk)) {
+      continue;
+    }
+
+    // Only include movements after today.
+    if (dk <= today) {
+      continue;
+    }
+
     rows.push([
-      m.name || '',
-      m.toPost || '',
-      m.toDept || '',
-      m.effDate || '',
-      m.pn || '',
-      m.remarkType || '',
+      m.name,
+      m.toPost,
+      m.toDept,
+      m.effDate,
+      m.pn,
+      m.remarkType,
       daysBetweenDK(today, dk)
     ]);
   }
-  rows.sort(function(a, b) { return (a[6] || 99999) - (b[6] || 99999); });
 
-  writeReadableSheet('Future Movements',
-    ['Person','To Post','To Dept','Effective Date','PN No.','Remark Type','Days Until'],
-    rows, [190,180,160,110,95,145,85], futureMovementsConditionalRules());
+  rows.sort(function(a, b) {
+    return Number(a[6]) - Number(b[6]);
+  });
+
+  writeReadableSheet(
+    'Future Movements',
+    [
+      'Person',
+      'To Post',
+      'To Dept',
+      'Effective Date',
+      'PN No.',
+      'Remark Type',
+      'Days Until'
+    ],
+    rows,
+    [190, 180, 160, 110, 95, 145, 85],
+    futureMovementsConditionalRules()
+  );
+
+  // Effective Date is a real date value; only set its appearance.
+  var sheet = SpreadsheetApp.getActiveSpreadsheet()
+    .getSheetByName('Future Movements');
+
+  if (sheet && rows.length > 0) {
+    sheet.getRange(2, 4, rows.length, 1)
+      .setNumberFormat('dd.MM.yyyy');
+  }
 }
 
 function refreshNoticeReview() {
@@ -589,11 +624,40 @@ function todayKey() {
   return d.getFullYear() + String(d.getMonth() + 1).padStart(2, '0') + String(d.getDate()).padStart(2, '0');
 }
 
-function parseDateKeyLocal(dateStr) {
-  var raw = String(dateStr || '').trim();
-  var m = raw.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})$/);
-  if (m) return m[3] + m[2].padStart(2, '0') + m[1].padStart(2, '0');
-  return raw;
+function parseDateKeyLocal(value) {
+  if (value === null || value === undefined || value === '') {
+    return '';
+  }
+
+  // Real Google Sheets date value
+  if (value instanceof Date && !isNaN(value.getTime())) {
+    return value.getFullYear() +
+      String(value.getMonth() + 1).padStart(2, '0') +
+      String(value.getDate()).padStart(2, '0');
+  }
+
+  var raw = String(value).trim();
+
+  // Canonical app/API date: YYYY-MM-DD
+  var iso = raw.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (iso) {
+    return iso[1] + iso[2] + iso[3];
+  }
+
+  // Legacy display format: D.M.YYYY or DD.MM.YYYY
+  var dmy = raw.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})$/);
+  if (dmy) {
+    return dmy[3] +
+      dmy[2].padStart(2, '0') +
+      dmy[1].padStart(2, '0');
+  }
+
+  // Already a chronological key: YYYYMMDD
+  if (/^\d{8}$/.test(raw)) {
+    return raw;
+  }
+
+  return '';
 }
 
 function daysBetweenDK(fromKey, toKey) {
@@ -614,7 +678,60 @@ function hashIdLocal(str) {
 
 // ---- row normalisation ----------------------------------------------------
 
+function normaliseEffectiveDate(value) {
+  // Already a real Google Sheets / Apps Script date
+  if (value instanceof Date && !isNaN(value)) {
+    return value.getFullYear() + '-' +
+      String(value.getMonth() + 1).padStart(2, '0') + '-' +
+      String(value.getDate()).padStart(2, '0');
+  }
 
+  var text = String(value == null ? '' : value).trim();
+
+  // New app/API format: YYYY-MM-DD
+  var iso = text.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+
+  // Existing GLD format: D.M.YYYY or DD.MM.YYYY
+  var dmy = text.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})$/);
+
+  // Chronological key, if supplied: YYYYMMDD
+  var key = text.match(/^(\d{4})(\d{2})(\d{2})$/);
+
+  var year, month, day;
+
+  if (iso) {
+    year = Number(iso[1]);
+    month = Number(iso[2]);
+    day = Number(iso[3]);
+  } else if (dmy) {
+    day = Number(dmy[1]);
+    month = Number(dmy[2]);
+    year = Number(dmy[3]);
+  } else if (key) {
+    year = Number(key[1]);
+    month = Number(key[2]);
+    day = Number(key[3]);
+  } else {
+    throw new Error(
+      'Invalid Effective Date. Expected YYYY-MM-DD or D.M.YYYY; received: ' +
+      text
+    );
+  }
+
+  var check = new Date(year, month - 1, day);
+
+  if (
+    check.getFullYear() !== year ||
+    check.getMonth() !== month - 1 ||
+    check.getDate() !== day
+  ) {
+    throw new Error('Invalid calendar date: ' + text);
+  }
+
+  return year + '-' +
+    String(month).padStart(2, '0') + '-' +
+    String(day).padStart(2, '0');
+}
 function toSheetEffectiveDate(value) {
   var iso = normaliseEffectiveDate(value);
   var p = iso.split('-');
