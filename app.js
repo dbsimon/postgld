@@ -2556,7 +2556,7 @@ for (var i = 0; i < recordRows.length; i++) {
         XLSX.utils.book_append_sheet(wb, recordsWs, 'Records');
         XLSX.utils.book_append_sheet(wb, colleaguesWs, 'Colleagues');
         XLSX.utils.book_append_sheet(wb, postsWs, 'Posts');
-        XLSX.writeFile(wb, `_Posting_Export_${new Date().toISOString().slice(0,10)}.xlsx`', {
+        XLSX.writeFile(wb, `_Posting_Export_${new Date().toISOString().slice(0,10)}.xlsx`, {
           cellDates: true
         });
         addLog('Excel 已成功導出。', 'info');
