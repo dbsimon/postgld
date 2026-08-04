@@ -2504,6 +2504,39 @@ function exportToExcel() {
             'PN No.': ''
         }]);
 
+      // Convert 「生效日期」 from text into genuine Excel date cells.
+var effectiveDateColumn = 7; // Column H, zero-based index 7
+var effectiveDateHeader = '生效日期';
+
+for (var i = 0; i < recordRows.length; i++) {
+    var sourceDate = recordRows[i][effectiveDateHeader];
+
+    if (!sourceDate) continue;
+
+    // Accept YYYY-MM-DD and the legacy D.M.YYYY / DD.MM.YYYY formats.
+    var iso = normaliseEffectiveDate(sourceDate);
+    var parts = iso.split('-');
+
+    // Construct locally to avoid a Hong Kong/UTC one-day date shift.
+    var excelDate = new Date(
+        Number(parts[0]),
+        Number(parts[1]) - 1,
+        Number(parts[2])
+    );
+
+    // Row 1 is the Excel header, so first data row uses zero-based row 1.
+    var cellAddress = XLSX.utils.encode_cell({
+        r: i + 1,
+        c: effectiveDateColumn
+    });
+
+    recordsWs[cellAddress] = {
+        t: 'd',
+        v: excelDate,
+        z: 'dd.mm.yyyy'
+    };
+}
+
         const colleaguesWs = XLSX.utils.json_to_sheet(colleagueRows.length ? colleagueRows : [{
             '姓名 (Name)': '',
             '人物備註': '',
@@ -2523,7 +2556,9 @@ function exportToExcel() {
         XLSX.utils.book_append_sheet(wb, recordsWs, 'Records');
         XLSX.utils.book_append_sheet(wb, colleaguesWs, 'Colleagues');
         XLSX.utils.book_append_sheet(wb, postsWs, 'Posts');
-        XLSX.writeFile(wb, `_Posting_Export_${new Date().toISOString().slice(0,10)}.xlsx`);
+        XLSX.writeFile(wb, `_Posting_Export_${new Date().toISOString().slice(0,10)}.xlsx`', {
+          cellDates: true
+        });
         addLog('Excel 已成功導出。', 'info');
     } catch (err) {
         console.error('exportToExcel error:', err);
