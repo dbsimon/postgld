@@ -1,6 +1,19 @@
 pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.worker.min.js';
 
 let records = JSON.parse(localStorage.getItem('sys_posting_records_pro')) || [];
+
+// ---- true-date patch ------------------------------------------------------
+function normaliseLocalRecordDates(list) {
+  return (list || []).map(function(r) {
+    try {
+      r.dateISO = normaliseEffectiveDate(r.dateISO || r.date);
+      r.date = formatEffectiveDate(r.dateISO); // screen display only
+    } catch (e) { r.dateISO = ''; }
+    return r;
+  });
+}
+records = normaliseLocalRecordDates(records);
+
 let sortState = { key: 'date', direction: 'desc' };
 let historyTarget = { type: null, value: null };
 let personNicknames = JSON.parse(localStorage.getItem('sys_person_nicknames_pro')) || {};
@@ -820,6 +833,7 @@ async function saveAllToSheets() {
 }
 
 async function doSaveToSheets() {
+  records = normaliseLocalRecordDates(records);
     const url = document.getElementById('gdriveLink') ? document.getElementById('gdriveLink').value.trim() : '';
     if (!url || !url.includes('script.google.com')) {
         showToast('請先在「設定」面板設定 Apps Script 連結。', 'warning');
@@ -1188,49 +1202,8 @@ function addLog(msg, type = 'default') {
     consoleBox.scrollTop = consoleBox.scrollHeight;
 }
 
-function parseDateKey(dateStr) {
-    const raw = (dateStr || '').trim();
-    if (!raw) return '';
-
-    const dotMatch = raw.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})$/);
-    if (dotMatch) {
-        const day = dotMatch[1].padStart(2, '0');
-        const month = dotMatch[2].padStart(2, '0');
-        const year = dotMatch[3];
-        return `${year}${month}${day}`;
-    }
-
-    const textMatch = raw.match(/^(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{4})$/);
-    if (textMatch) {
-        const monthMap = {
-            jan: '01', january: '01',
-            feb: '02', february: '02',
-            mar: '03', march: '03',
-            apr: '04', april: '04',
-            may: '05',
-            jun: '06', june: '06',
-            jul: '07', july: '07',
-            aug: '08', august: '08',
-            sep: '09', sept: '09', september: '09',
-            oct: '10', october: '10',
-            nov: '11', november: '11',
-            dec: '12', december: '12'
-        };
-        const day = textMatch[1].padStart(2, '0');
-        const month = monthMap[textMatch[2].toLowerCase()] || '00';
-        const year = textMatch[3];
-        return `${year}${month}${day}`;
-    }
-
-    const parsed = new Date(raw);
-    if (!isNaN(parsed.getTime())) {
-        const year = String(parsed.getFullYear());
-        const month = String(parsed.getMonth() + 1).padStart(2, '0');
-        const day = String(parsed.getDate()).padStart(2, '0');
-        return `${year}${month}${day}`;
-    }
-
-    return raw;
+function parseDateKey(dateValue) {
+  try { return effectiveDateToKey(dateValue); } catch (e) { return ''; }
 }
 
 function cleanDirectoryName(name) {
@@ -2531,6 +2504,39 @@ function exportToExcel() {
             'PN No.': ''
         }]);
 
+      // Convert 「生效日期」 from text into genuine Excel date cells.
+var effectiveDateColumn = 7; // Column H, zero-based index 7
+var effectiveDateHeader = '生效日期';
+
+for (var i = 0; i < recordRows.length; i++) {
+    var sourceDate = recordRows[i][effectiveDateHeader];
+
+    if (!sourceDate) continue;
+
+    // Accept YYYY-MM-DD and the legacy D.M.YYYY / DD.MM.YYYY formats.
+    var iso = normaliseEffectiveDate(sourceDate);
+    var parts = iso.split('-');
+
+    // Construct locally to avoid a Hong Kong/UTC one-day date shift.
+    var excelDate = new Date(
+        Number(parts[0]),
+        Number(parts[1]) - 1,
+        Number(parts[2])
+    );
+
+    // Row 1 is the Excel header, so first data row uses zero-based row 1.
+    var cellAddress = XLSX.utils.encode_cell({
+        r: i + 1,
+        c: effectiveDateColumn
+    });
+
+    recordsWs[cellAddress] = {
+        t: 'd',
+        v: excelDate,
+        z: 'dd.mm.yyyy'
+    };
+}
+
         const colleaguesWs = XLSX.utils.json_to_sheet(colleagueRows.length ? colleagueRows : [{
             '姓名 (Name)': '',
             '人物備註': '',
@@ -2550,7 +2556,9 @@ function exportToExcel() {
         XLSX.utils.book_append_sheet(wb, recordsWs, 'Records');
         XLSX.utils.book_append_sheet(wb, colleaguesWs, 'Colleagues');
         XLSX.utils.book_append_sheet(wb, postsWs, 'Posts');
-        XLSX.writeFile(wb, `_Posting_Export_${new Date().toISOString().slice(0,10)}.xlsx`);
+        XLSX.writeFile(wb, `_Posting_Export_${new Date().toISOString().slice(0,10)}.xlsx`, {
+          cellDates: true
+        });
         addLog('Excel 已成功導出。', 'info');
     } catch (err) {
         console.error('exportToExcel error:', err);
